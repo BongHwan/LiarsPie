@@ -22,7 +22,7 @@
         <button type="button" id="logout" class="ghost small" hidden>로그아웃</button>
       </div>
       <nav class="jump">
-        <a href="#overview">개요</a><a href="#accounts">계좌</a><a href="#chart">차트</a><a href="#sim">시뮬레이션</a><a href="#guides">전략 설명</a>
+        <a href="#overview">개요</a><a href="#chart">차트</a><a href="#accounts">계좌</a><a href="#sim">시뮬레이션</a><a href="#guides">전략 설명</a>
         <a href="#stats">성과</a><a href="#market">시장</a><a href="#history">기록</a><a href="#system">라즈베리파이</a>
       </nav>
     </div>
@@ -80,6 +80,25 @@
     <div class="card"><div class="label">최대 낙폭</div><div class="value num" id="mdd">-</div><div class="sub" id="mddSub">자산 고점 대비</div></div>
   </div>
 
+  <!-- 계좌 한눈에 (한 계좌 한 줄) -->
+  <section class="card" id="brief">
+    <h2><span class="ico">📋</span>코인 계좌 한눈에 <small>누르면 아래 차트가 그 종목으로 바뀌어요 · 자세한 건 아래 계좌 카드</small></h2>
+    <div class="brief" id="briefList"></div>
+  </section>
+
+  <!-- 차트 -->
+  <section class="card" id="chart">
+    <h2><span class="ico">📈</span>가격 차트 <small id="chartSub">일봉 · ▲매수 ▼매도</small>
+      <span class="right seg ranges" id="daysSeg">
+        <button type="button" data-span="5y">5년</button><button type="button" data-span="1y">1년</button><button type="button" data-span="6m">6개월</button><button type="button" data-span="3m" aria-pressed="true">3달</button><button type="button" data-span="1m">1개월</button><button type="button" data-span="1w">1주</button><button type="button" data-span="1d">1일</button><button type="button" data-span="1h">1시간</button>
+      </span>
+      <select class="range-select" id="daysSel" aria-label="차트 기간"></select>
+    </h2>
+    <div class="pills" id="chartPills"></div>
+    <div class="chart-box" id="candleBox"><div class="empty">차트를 불러오는 중…</div></div>
+    <div class="legend" id="candleLegend"></div>
+  </section>
+
   <!-- 코인 계좌 -->
   <section id="accounts" style="margin-top:14px">
     <h2 style="margin:0 0 10px"><span class="ico">📦</span>코인 계좌 <small class="muted" style="font-weight:400;font-size:12.5px">코인 하나 + 전략 · 자기 원화로만 사고, 팔면 원화가 계좌에 남아요</small></h2>
@@ -102,19 +121,6 @@
       <input id="addPin" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off" maxlength="32" aria-label="PIN">
       <button type="button" class="primary" id="addGo">코인 계좌 만들기</button>
     </div>
-  </section>
-
-  <!-- 차트 -->
-  <section class="card" id="chart">
-    <h2><span class="ico">📈</span>가격 차트 <small id="chartSub">일봉 · ▲매수 ▼매도</small>
-      <span class="right seg ranges" id="daysSeg">
-        <button type="button" data-span="5y">5년</button><button type="button" data-span="1y">1년</button><button type="button" data-span="6m">6개월</button><button type="button" data-span="3m" aria-pressed="true">3달</button><button type="button" data-span="1m">1개월</button><button type="button" data-span="1w">1주</button><button type="button" data-span="1d">1일</button><button type="button" data-span="1h">1시간</button>
-      </span>
-      <select class="range-select" id="daysSel" aria-label="차트 기간"></select>
-    </h2>
-    <div class="pills" id="chartPills"></div>
-    <div class="chart-box" id="candleBox"><div class="empty">차트를 불러오는 중…</div></div>
-    <div class="legend" id="candleLegend"></div>
   </section>
 
   <!-- 전략 순위 · 시뮬레이션 -->
@@ -215,6 +221,7 @@
 <div class="toasts" id="toasts"></div>
 
 <script src="/rules.js"></script>
+<script src="/curve.js"></script>
 <script src="/simjob.js"></script>
 <script src="/pi.js"></script>
 <script src="/settings.js"></script>
@@ -365,6 +372,7 @@ function renderAll() {
   renderResults(d.results);
   if (S.add && !$('addBox').hidden && addSig() !== S.addSig) renderAdd();  // 순위 계산이 끝나면 고르는 칸도 새로
   renderDonut(s);
+  renderBrief(s);
   renderSlots(s);
   renderSelected(s);
   renderPills();
@@ -427,6 +435,47 @@ function planLine(x) {
   return [x.tf === '1d' ? '오늘 신호' : '이번 봉 신호', x.holding ? '보유 유지' : '관망'];
 }
 
+// 계좌 한눈에: 한 계좌 한 줄 (이름 · 상태 · 평가금액 · 수익률). 누르면 차트가 그 종목으로
+function renderBrief(s) {
+  const box = $('briefList');
+  box.innerHTML = '';
+  if (!s.slots.length) { box.append(el('p', { class: 'muted', text: '아직 코인 계좌가 없어요. 아래 ＋ 코인 계좌 만들기로 만들어요.' })); return; }
+  box.append(el('div', { class: 'brief-row head' }, el('span'), el('span', { text: '계좌' }), el('span', { text: '상태' }),
+                el('span', { class: 'brief-val', text: '평가금액' }), el('span', { class: 'brief-ret', text: '수익률' })));
+  s.slots.forEach((x, i) => {
+    const [mark, word] = x.closing ? ['🧹', '팔고 빼는 중'] : x.holding ? ['🟢', '보유'] : x.book.krw >= (S.data.min_order || 5000) ? ['⏳', '대기'] : ['👀', '지켜보기'];
+    const ret = el('span', { class: 'brief-ret num', text: pct(x.return_pct) }); tone(ret, x.return_pct);
+    const row = el('div', { class: 'brief-row' + (x.rank_key === S.sel ? ' sel' : ''), role: 'button', tabindex: '0', title: '눌러서 이 종목 차트 보기' },
+      el('span', { class: 'brief-dot', style: `background:${slotColor(i)}` }),
+      el('span', { class: 'brief-name' }, x.name, el('small', { text: `${sym(x.market)} · ${x.tf_label}` })),
+      el('span', { class: 'brief-state', title: word }, mark, el('span', { class: 'brief-word', text: ' ' + word })),
+      el('span', { class: 'brief-val num', text: won(x.equity) }), ret);
+    row.onclick = () => selectMarket(x.rank_key);
+    row.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectMarket(x.rank_key); } };
+    box.append(row);
+  });
+}
+
+// 계좌 카드 접기·펼치기: 처음엔 접혀서 이름·현재가·전략 줄과 계좌 금액(수익률)만, 누르면 펼쳐서 전부와 작은 수익 그래프(curve.js).
+// 펼친 카드는 이 기기에 기억한다 (못 쓰는 브라우저면 그냥 매번 접힌 채로)
+const CARD_KEY = 'mypie.cards.coin';
+const openCards = (() => { try { return new Set(JSON.parse(localStorage.getItem(CARD_KEY) || '[]')); } catch (e) { return new Set(); } })();
+function toggleCard(id, open) {
+  if (open) openCards.add(id); else { openCards.delete(id); if (S.open.slot === id) S.open = {}; }
+  try { localStorage.setItem(CARD_KEY, JSON.stringify([...openCards])); } catch (e) { /* 기억만 못 한다 */ }
+  renderSlots(S.data.status);
+}
+function foldParts(x) {  // [펼치기·접기 버튼, 접혔을 때 한 줄], 펼쳤는지
+  const expanded = openCards.has(x.id) || S.open.slot === x.id;
+  const fold = el('button', { type: 'button', class: 'ghost small fold' + (expanded ? ' up' : ''), 'aria-expanded': String(expanded),
+                             'aria-label': expanded ? '접기' : '펼치기', title: expanded ? '접기' : '펼치기' });
+  fold.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';  // 굵은 화살표 (글자 ▾는 폰에서 점처럼 작다)
+  fold.onclick = (ev) => { ev.stopPropagation(); toggleCard(x.id, !expanded); };
+  const ret = el('span', { class: 'num', text: `(${pct(x.return_pct)})` }); tone(ret, x.return_pct);
+  const sum = el('div', { class: 'slot-sum num' }, el('span', { class: 'label', text: '계좌 ' }), won(x.equity) + ' ', ret);
+  return [fold, sum, expanded];
+}
+
 function renderSlots(s) {
   const box = $('portfolio');
   const focused = document.activeElement && box.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName);
@@ -438,8 +487,11 @@ function renderSlots(s) {
     const card = el('div', { class: 'card slot-card' + (x.rank_key === S.sel ? ' sel' : ''), title: '눌러서 이 종목의 차트·순위 보기' });
     card.append(el('div', { class: 'bar', style: `background:${slotColor(i)}` }));
     const chip = x.closing ? '🧹 팔고 빼는 중' : x.holding ? '🟢 보유' : x.book.krw >= (S.data.min_order || 5000) ? '⏳ 대기' : '👀 지켜보기';
+    const [fold, sum, expanded] = foldParts(x);
+    card.classList.add(expanded ? 'open' : 'folded');
     const head = el('div', { class: 'slot-head' },
-      el('div', { class: 'slot-name' }, x.name, el('small', { text: sym(x.market) })), el('span', { class: 'chip', text: chip }));
+      el('div', { class: 'slot-name' }, x.name, el('small', { text: sym(x.market) })),
+      el('div', { class: 'slot-chips' }, el('span', { class: 'chip', text: chip }), fold));
     const nextMs = parseTs(x.next_at).getTime() - (Date.now() + S.offset);
     const when = el('div', { class: 'slot-when' }, el('span', { class: 'chip', text: `⏱ ${x.tf_label}` }),
       ` 다음 판단 ${x.tf === '1d' ? '09:00' : x.next_at.slice(11, 16)} · `, el('span', { 'data-next': x.next_at, text: leftText(nextMs) }));
@@ -448,6 +500,12 @@ function renderSlots(s) {
     const [pl, pv] = planLine(x);
     const strat = el('div', { class: 'slot-strat' }, el('b', {}, '🧠 ', ...ruleNodes(x.rule, stratLabel, ruleSignals(x))),
                            x.stop_loss > 0 ? el('span', { class: 'tag stop', text: '🛑 ' + stopText(x.stop_loss) }) : '', ` · ${pl} ${pv}`);
+    if (!expanded) {  // 접힌 카드: 이름 · 주기 · 현재가 · 전략 줄과 계좌 금액(수익률). 누르면 펼치고 차트도 그 종목으로
+      card.append(head, when, price, strat, sum);
+      card.onclick = () => { toggleCard(x.id, true); selectMarket(x.rank_key); };
+      box.append(card);
+      return;
+    }
     const state = el('div', { class: 'slot-state', text: (x.holding ? '🟢 ' : '⏳ ') + x.state_text });
     const m = byMarket[x.market];
     const ret = el('div', { class: 'v num', text: pct(x.return_pct) }); tone(ret, x.return_pct);
@@ -469,7 +527,9 @@ function renderSlots(s) {
       acts.append(b);
     }
     if (S.open.slot === x.id) panel.append(slotPanel(x, S.open.kind));
-    card.append(head, when, price, strat, state, foot, acts, panel);
+    // 펼친 카드: 넓은 화면에서는 한 줄을 다 쓰고 왼쪽(가격·전략) · 오른쪽(숫자 칸·그래프)으로 나눈다
+    card.append(head, el('div', { class: 'slot-body' }, el('div', { class: 'slot-main' }, when, price, strat, state),
+                         el('div', { class: 'slot-side' }, foot, curveBox('coin', x.id))), acts, panel);
     card.onclick = (ev) => { if (!ev.target.closest('.slot-actions, .panel')) selectMarket(x.rank_key); };
     box.append(card);
   });

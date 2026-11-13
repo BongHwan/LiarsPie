@@ -7,6 +7,7 @@
   GET  /api/simulate 전략 시뮬레이션 (?market=KRW-BTC&tf=240m&days=90&strategy=ma_cross)
   GET  /api/simjob   긴 기간 시뮬레이션 계산 작업의 진행 상황
   GET  /api/cpu      코어별 CPU 이용률 (최근 60초, 1초 간격)
+  GET  /api/curve    계좌 카드의 작은 그래프: 첫 매매부터 전략 vs 그냥 들고 있었다면 (?kind=coin|stock&slot=s1)
   POST /api/simjob   긴 기간 시뮬레이션 계산 시작·멈춤 {"action": "start", "kind": "coin", "query": "market=..."}
   GET  /api/stats    성과 통계, 종목별 성적, 날짜별 손익
   GET  /api/system   라즈베리파이 상태 (온도, 메모리, 디스크, 전원)
@@ -14,7 +15,7 @@
   POST /api/ranking  아직 순위가 없는 종목의 전략 순위 계산 부탁 (PIN 불필요)
   POST /api/telegram/start|link|action   웹페이지에서 텔레그램 연결·관리 (PIN 필요)
   POST /api/keys                         업비트·토스증권 API 키 넣기 (PIN 필요, 집 와이파이에서만)
-  POST /api/login/send|verify, /api/logout  텔레그램 코드 로그인
+  POST /api/login/send|verify|wait, /api/logout  텔레그램 코드 로그인 (wait: 텔레그램 [✅ 들여보내기]를 눌렀는지)
 
 텔레그램이 연결돼 있으면 모든 페이지·API에 로그인이 필요하다 (/healthz 제외).
 """
@@ -35,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import auth, backtest, krx, network, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
+from . import auth, backtest, curve, krx, network, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
 from .stockbot import REGULAR_TF, regular_ready
 from .broker import MIN_ORDER_KRW
 from .config import load_config
@@ -904,7 +905,7 @@ def build_system(db_path: str) -> dict:
     try:
         info["load"] = os.getloadavg()[0]
         info["cpus"] = os.cpu_count()
-    except OSError:
+    except (OSError, AttributeError):  # 윈도우에는 getloadavg가 없다
         pass
     meminfo = _read("/proc/meminfo")
     if meminfo:
@@ -930,6 +931,20 @@ def build_system(db_path: str) -> dict:
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         pass
     return info
+
+
+def build_curve(db_path: str, stock_db_path: str, kind: str, slot: str) -> dict:
+    """계좌 카드의 작은 그래프 (curve.py): 첫 매매부터 그 계좌 전략의 수익률과 그냥 들고 있었다면의 수익률."""
+    db = _open(stock_db_path if kind == "stock" else db_path)
+    if not db:
+        return {"start": None, "points": []}
+    try:
+        status = db.get_state("status")
+        if kind == "stock":
+            return curve.stock(db, status, slot, REGULAR_TF)
+        return curve.coin(db, status, slot)
+    finally:
+        db.close()
 
 
 def _check_pin(db: Database, pin_input: str) -> tuple[int, str] | None:
@@ -1330,16 +1345,40 @@ def login_send(db_path: str, digits: int, client: dict) -> tuple[int, dict]:
     try:
         with _login_lock:
             code = auth.issue_code(db, digits)
+            ask = auth.open_ask(db, client["ip"])
     except auth.TooSoon as e:
         return 429, {"ok": False, "message": str(e), "wait": e.wait}
     finally:
         db.close()
+    buttons = [[("✅ 들여보내기", f"login:yes:{ask}"), ("🙅 거절", f"login:no:{ask}")]]
+    if not is_home(client["ip"]):
+        buttons.append(("🚫 이 IP 막기", f"ban:{client['ip']}"))
     try:
-        telegram.send(f"{code} ({client['ip']})", creds)  # 짧게: 코드와 요청한 기기 IP만
+        telegram.send(f"{code} ({client['ip']})", creds, buttons)  # 짧게: 코드와 요청한 기기 IP만
     except telegram.TelegramError as e:
         return 502, {"ok": False, "message": f"텔레그램으로 보내지 못했어요 ({e}). "
                                              "파이에서 python3 -m mypie.telegram --code 로 코드를 받을 수도 있어요."}
-    return 200, {"ok": True, "message": "텔레그램으로 로그인 코드를 보냈어요.", "wait": auth.RESEND_SEC}
+    return 200, {"ok": True, "message": "텔레그램으로 로그인 코드를 보냈어요.", "wait": auth.RESEND_SEC, "ask": ask}
+
+
+def login_wait(db_path: str, ask: str, hours: float, client: dict, trust_hours: float = 24) -> tuple[int, dict, str | None]:
+    """로그인 화면이 몇 초마다 묻는다: 텔레그램에서 [✅ 들여보내기]를 눌렀으면 로그인시킨다."""
+    db = _open(db_path)
+    if not db:
+        return 503, {"ok": False, "message": "봇이 아직 시작되지 않았어요."}, None
+    try:
+        with _login_lock:
+            answer = auth.take_ask(db, ask, client["ip"])
+            token = auth.create_session(db, hours, client) if answer == "yes" else None
+            if token and trust_hours > 0:
+                auth.trust_ip(db, client["ip"], trust_hours)
+    finally:
+        db.close()
+    if token:
+        return 200, {"ok": True, "message": "텔레그램에서 들여보냈어요."}, token
+    if answer == "no":
+        return 200, {"ok": False, "rejected": True, "message": "텔레그램에서 거절했어요."}, None
+    return 200, {"ok": False, "waiting": answer == "wait"}, None
 
 
 def login_verify(db_path: str, code: str, hours: float, client: dict, trust_hours: float = 24) -> tuple[int, dict, str | None]:
@@ -1402,7 +1441,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         route, query = url.path, parse_qs(url.query)
-        if route in ("/app.css", "/rules.js", "/pi.js", "/simjob.js", "/settings.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
+        if route in ("/app.css", "/rules.js", "/curve.js", "/pi.js", "/simjob.js", "/settings.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
             kind = "text/css" if route.endswith(".css") else "text/javascript"
             self._send(200, (STATIC_DIR / route[1:]).read_bytes(), kind + "; charset=utf-8")
             return
@@ -1435,6 +1474,8 @@ class Handler(BaseHTTPRequestHandler):
                                                       _query_stop(query)),
             "/api/simjob": lambda: {"job": simjob.read_state(simulation.folder(self.db_path))},
             "/api/cpu": cpu_sampler.snapshot,
+            "/api/curve": lambda: build_curve(self.db_path, self.stock_db_path, query.get("kind", ["coin"])[0],
+                                              query.get("slot", [""])[0][:40]),
             "/api/stats": lambda: build_stats(self.db_path),
             "/api/system": lambda: build_system(self.db_path),
             "/api/stock/status": lambda: build_stock_payload(self.stock_db_path, self.db_path),
@@ -1462,7 +1503,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route = urlparse(self.path).path
-        public = ("/api/login/send", "/api/login/verify")
+        public = ("/api/login/send", "/api/login/verify", "/api/login/wait")
         private = ("/api/control", "/api/ranking", "/api/logout",
                    "/api/telegram/start", "/api/telegram/link", "/api/telegram/action",
                    "/api/stock/control", "/api/stock/ranking", "/api/simjob", "/api/pin", "/api/keys")
@@ -1499,9 +1540,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = {"ok": code == 200, "message": message}
             elif route == "/api/login/send":
                 code, body = login_send(self.db_path, code_digits(self.db_path), self._client())
-            elif route == "/api/login/verify":
-                code, body, token = login_verify(self.db_path, str(data.get("code", "")), self.session_hours, self._client(),
-                                                 self.trust_hours)
+            elif route in ("/api/login/verify", "/api/login/wait"):
+                if route == "/api/login/verify":
+                    code, body, token = login_verify(self.db_path, str(data.get("code", "")), self.session_hours, self._client(),
+                                                     self.trust_hours)
+                else:
+                    code, body, token = login_wait(self.db_path, str(data.get("ask", ""))[:40], self.session_hours,
+                                                   self._client(), self.trust_hours)
                 if token:  # Lax: 텔레그램 등 다른 앱의 링크로 열어도 쿠키가 붙는다 (Strict면 매번 다시 로그인)
                     cookie = (f"{self.COOKIE}={token}; Max-Age={round(self.session_hours * 3600)}; Path=/; "
                               "HttpOnly; SameSite=Lax")

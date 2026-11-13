@@ -137,13 +137,13 @@
   @media (max-width: 760px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
   /* 종목 카드 */
-  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }  /* 펼친 카드는 줄을 바꿔 한 줄을 다 쓴다 (순서는 그대로) */
   .slot-card { cursor: pointer; transition: transform .12s, box-shadow .12s; position: relative; }
   .slot-card:hover { transform: translateY(-2px); }
   .slot-card.sel { outline: 2px solid var(--brand); outline-offset: -1px; }
   .slot-card .bar { position: absolute; left: 0; top: 14px; bottom: 14px; width: 4px; border-radius: 0 4px 4px 0; }
   .slot-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .slot-name { font-weight: 750; font-size: 15.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .slot-name { font-weight: 750; font-size: 15.5px; line-height: 1.3; min-width: 0; overflow-wrap: anywhere; }  /* 긴 이름은 두 줄로 */
   .slot-name small { color: var(--muted); font-weight: 500; margin-left: 4px; }
   .slot-price { font-size: 20px; font-weight: 800; letter-spacing: -0.02em; margin-top: 6px; }
   .slot-strat { font-size: 13px; margin-top: 6px; }
@@ -345,6 +345,47 @@
   .range-select { display: none; min-height: 34px; padding: 4px 10px; font-size: 13px; }
   @media (max-width: 640px) { .seg.ranges { display: none; } .range-select { display: inline-block; margin-left: auto; } }
 
+  /* 계좌 한눈에: 한 계좌 한 줄 (칸 너비는 모든 줄이 같게 subgrid) */
+  .brief { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto auto; column-gap: 10px; }
+  .brief > p { grid-column: 1 / -1; margin: 0; }
+  .brief-row { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center;
+               padding: 9px 6px; border-top: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+  .brief-row.head { border-top: 0; padding-top: 0; cursor: default; font-size: 12px; color: var(--muted); }
+  .brief-row:not(.head):hover, .brief-row.sel { background: var(--soft); }
+  .brief-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .brief-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+  .brief-name small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+  .brief-state { white-space: nowrap; font-size: 13px; }
+  .brief-val, .brief-ret { text-align: right; white-space: nowrap; }
+  .brief-ret { min-width: 4.6em; font-weight: 650; }
+  @media (max-width: 480px) { .brief { column-gap: 7px; } .brief-name small { display: none; } .brief-word { display: none; } }
+  /* 계좌 카드 접기·펼치기와 작은 수익 그래프 (curve.js) */
+  .slot-chips { display: flex; align-items: center; gap: 6px; flex: none; }
+  .slot-card .slot-head { align-items: flex-start; }
+  button.fold { width: 34px; height: 34px; padding: 0; min-height: 0; border-radius: 50%; display: grid; place-items: center;
+          color: var(--text); background: var(--soft); }
+  .fold svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round;
+              transition: transform .15s; }
+  .fold.up svg { transform: rotate(180deg); }
+  .slot-card.folded { display: flex; flex-direction: column; }        /* 한 줄의 접힌 카드끼리 높이를 맞추고 */
+  .slot-sum { margin-top: auto; padding-top: 10px; font-size: 17px; font-weight: 700; }  /* 계좌 금액은 맨 아래로 */
+  .slot-body { display: grid; gap: 0 22px; }
+  @media (min-width: 720px) {  /* 펼친 카드는 한 줄을 다 쓰고 왼쪽 · 오른쪽으로 */
+    .slots > .slot-card.open { grid-column: 1 / -1; }
+    .slot-card.open .slot-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr); align-items: start; }
+    .slot-card.open .slot-foot { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 6px; }
+  }
+  .slot-sum .label { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .curve { margin-top: 10px; padding: 10px 12px; border-radius: 12px; background: var(--soft); font-size: 12.5px; color: var(--muted); }
+  .curve svg { display: block; width: 100%; height: 76px; margin: 6px 0 2px; }
+  .curve.empty { background: none; padding: 2px; font-size: 12px; }
+  .curve-strat { fill: none; stroke: var(--brand); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .curve-hold { fill: none; stroke: var(--muted); stroke-width: 1.4; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+  .curve-zero { fill: none; stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .curve-head, .curve-foot { display: flex; justify-content: space-between; gap: 4px 8px; flex-wrap: wrap; }
+  .curve-foot { font-size: 11px; }
+  .curve-legend { display: flex; gap: 4px 10px; flex-wrap: wrap; }
+  .c-strat { color: var(--brand); font-weight: 650; }
   /* 살 때 · 팔 때 전략 고르기 (rules.js) */
   .rule { display: grid; gap: 6px; min-width: 0; }
   .rule-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }

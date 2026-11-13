@@ -26,7 +26,7 @@ import time
 from dataclasses import asdict
 from datetime import timedelta
 
-from . import backtest, buyhold, network, reports, sshwatch, stoploss, telegram, timeframes, upbit
+from . import alerts, auth, backtest, buyhold, network, reports, sshwatch, stoploss, telegram, timeframes, upbit
 from .broker import MIN_ORDER_KRW, Book, LiveExecutor, PaperExecutor, migrate_book, new_slot_id
 from .config import load_config
 from .db import Database
@@ -50,6 +50,9 @@ REQUEST_PREFIX = "request:"  # 웹페이지가 남기는 요청 (request:<시각
 MAX_RESULTS = 20
 KEY_WARN_DAYS = (30, 14, 7, 3, 1)  # 업비트 키 만료 며칠 전에 텔레그램으로 알릴지
 MARKET_PATTERN = re.compile(r"^KRW-[A-Z0-9]{1,15}$")
+PI_CHECK_SEC = 60            # 파이 온도·전압 확인 간격
+HOT_C, HOT_SEC = 85, 180     # 이 온도가 이만큼 이어지면 알린다
+PI_WARN_EVERY_SEC = 6 * 3600  # 같은 경고는 6시간에 한 번
 
 
 class Slot:
@@ -124,6 +127,7 @@ class Bot:
         self.markets_day: str | None = stored.get("day") if stored.get("all") else None  # 예전(상위 30개) 목록이면 바로 다시 받는다
         self.key_day: str | None = (db.get_state("key_info") or {}).get("checked")
         self.env_stamp: int | None = None  # .env가 바뀌면 새 키를 쓴다 (_watch_keys)
+        self.last_pi_check, self.hot_since = 0.0, None  # 파이 온도·전압 경고 (_check_pi)
         self.report_day: str | None = db.get_state("report_day")
         self.last_snapshot = 0.0
         self.last_exchange_check = 0.0
@@ -227,8 +231,8 @@ class Bot:
         self._notify(reports.daily_text(trades, self.db.get_state("status")), prefix="")
 
     def _listen_commands(self) -> None:
-        """텔레그램 명령(/상태, /기록, /도움)에 답한다. 따로 도는 스레드라서 DB 연결도 따로 연다.
-        연결된 내 채팅에서 온 메시지에만 답한다."""
+        """텔레그램 명령(/상태, /기록, /신호, /파이, /알림 …)과 메시지 아래 버튼에 답한다.
+        따로 도는 스레드라서 DB 연결도 따로 연다. 연결된 내 채팅에서 온 것에만 답한다."""
         db = Database(self.db.path)
         offset, menu_set = None, False
         while not self.stop_event.is_set():
@@ -253,20 +257,111 @@ class Bot:
                 continue
             for update in updates:
                 offset = update["update_id"] + 1
+                if update.get("callback_query"):
+                    self._on_button(update["callback_query"], creds, db)
+                    continue
                 message = update.get("message") or {}
                 if str(message.get("chat", {}).get("id")) != str(chat):
                     continue
                 try:
-                    step = reports.reboot_step(message.get("text", ""))
+                    text = message.get("text", "")
+                    step = reports.reboot_step(text)
                     if step == "do":
                         telegram.send("🔄 재부팅해요. 1~2분 뒤 봇이 다시 시작하면 알려드려요.", creds)
                         self.event("info", "텔레그램 명령으로 라즈베리파이를 재부팅해요")
                         self._reboot(creds)
                         continue
-                    telegram.send(reports.REBOOT_ASK if step == "ask"
-                                  else reports.command_reply(message.get("text", ""), db, self.cfg["stock"]["db_path"]), creds)
+                    stock_db, view = self.cfg["stock"]["db_path"], reports.view_of(text)
+                    if view:  # /상태 · /주식 · /신호 · /파이: 아래 버튼으로 같은 메시지에서 바꿔 본다
+                        telegram.send(reports.view_text(view, db, stock_db), creds, reports.view_buttons(view))
+                        continue
+                    reply, buttons = alerts.command(text, db) or (None, None)
+                    if reply is None:
+                        reply = reports.REBOOT_ASK if step == "ask" else sshwatch.firewall_reply(text)
+                    telegram.send(reply or reports.command_reply(text, db, stock_db), creds, buttons)
                 except telegram.TelegramError as e:
                     log.warning("텔레그램 답장 실패: %s", e)
+
+    def _on_button(self, query: dict, creds, db: Database) -> None:
+        """메시지 아래 버튼을 눌렀을 때 (내 채팅에서 누른 것만).
+          ban:<IP>           SSH를 두드린(또는 로그인하려는) 그 IP를 파이 방화벽으로 막는다
+          login:yes|no:<번호> 웹페이지 로그인 들여보내기·거절
+          view:<화면>        /상태 · /주식 · /신호 · /파이 메시지를 그 화면으로 바꾼다
+          alert:del:<번호>   가격 알림 지우기"""
+        token, chat = creds
+        data = str(query.get("data") or "")
+        message = query.get("message") or {}
+        mine = str((message.get("chat") or {}).get("id")) == str(chat)
+        toast, reply, edit = "", None, None  # 버튼 위 짧은 안내 · 새 답장 · 그 메시지 바꾸기 (글, 버튼)
+        try:
+            if not mine:
+                pass
+            elif data.startswith(sshwatch.BAN):
+                toast, reply = "막는 중…", sshwatch.block_text(data[len(sshwatch.BAN):])
+                db.add_event("info", "텔레그램 버튼 · " + reply.splitlines()[0])
+            elif data.startswith("login:"):
+                _, answer, ask_id = (data.split(":", 2) + ["", ""])[:3]
+                ask = auth.answer_ask(db, ask_id, answer == "yes")
+                toast = ("들여보냈어요" if answer == "yes" else "거절했어요") if ask else "지났거나 이미 답한 로그인이에요"
+                if ask:
+                    edit = (message.get("text", "") + ("\n✅ 들여보냈어요" if answer == "yes" else "\n🙅 거절했어요"), None)
+                    db.add_event("info", f"텔레그램 버튼 · 웹페이지 로그인 {'들여보냄' if answer == 'yes' else '거절'} ({ask['ip']})")
+            elif data.startswith(reports.VIEW):
+                view = data[len(reports.VIEW):]
+                if view in reports.VIEWS:
+                    edit = (reports.view_text(view, db, self.cfg["stock"]["db_path"]), reports.view_buttons(view))
+            elif data.startswith(alerts.DELETE):
+                gone = alerts.delete(db, data[len(alerts.DELETE):])
+                toast = "지웠어요" if gone else "이미 없는 알림이에요"
+                edit = alerts.list_reply(db)
+            telegram.call(token, "answerCallbackQuery", {"callback_query_id": query.get("id"), "text": toast})
+            if edit and message.get("message_id"):
+                try:
+                    telegram.edit(message["message_id"], edit[0], creds, edit[1])
+                except telegram.TelegramError as e:  # 글이 그대로면 텔레그램이 '바뀐 게 없다'며 거절한다
+                    if "not modified" not in str(e):
+                        raise
+            if reply:
+                telegram.send(reply, creds)
+        except telegram.TelegramError as e:
+            log.warning("텔레그램 버튼 처리 실패: %s", e)
+
+    def _check_alerts(self, prices: dict) -> None:
+        """가격 알림 (/알림 BTC 1억): 그 가격에 닿으면 한 번 알리고 지운다. 계좌가 없는 종목은 가격을 따로 받는다."""
+        wanted = {a["market"] for _, a in alerts.alerts(self.db)}
+        missing = sorted(wanted - set(prices))
+        if missing:
+            try:
+                prices = {**prices, **upbit.get_prices(missing)}
+            except upbit.UpbitError as e:
+                log.debug("가격 알림용 시세를 받지 못했어요: %s", e)
+        for alert, price in alerts.due(self.db, prices):
+            self.notifier(alerts.hit_text(alert, price))
+
+    def _check_pi(self) -> None:
+        """1분마다 파이 온도·전압을 본다. 85°C 넘게 3분 이어지거나 전압이 모자라면 텔레그램으로 알린다
+        (같은 경고는 6시간에 한 번). 긴 시뮬레이션 중 80°C 언저리는 정상이라 85°C부터 알린다."""
+        now = time.monotonic()
+        if now - self.last_pi_check < PI_CHECK_SEC:
+            return
+        self.last_pi_check = now
+        from .web import build_system  # 웹페이지 라즈베리파이 카드와 같은 값
+
+        info = build_system(str(self.db.path))
+        temp = info.get("temp_c")
+        self.hot_since = (self.hot_since or now) if temp is not None and temp >= HOT_C else None
+        problems = []
+        if self.hot_since is not None and now - self.hot_since >= HOT_SEC:
+            problems.append(("hot", f"🌡 파이가 뜨거워요: {temp:.1f}°C가 {HOT_SEC // 60}분 넘게 이어져요. "
+                                    "통풍이 되는지, 방열판·팬이 있는지 확인해 주세요."))
+        if info.get("undervoltage_now"):
+            problems.append(("volt", "⚡ 파이 전압이 모자라요. SD카드가 깨질 수 있어요. 정격 어댑터와 짧고 굵은 케이블로 바꿔 주세요."))
+        warned = self.db.get_state("pi_warned") or {}
+        for kind, text in problems:
+            if time.time() - warned.get(kind, 0) >= PI_WARN_EVERY_SEC:
+                warned[kind] = time.time()
+                self.db.set_state("pi_warned", warned)
+                self.event("warning", text, notify=True)
 
     def _reboot(self, creds) -> None:
         """파이를 다시 켠다. 비밀번호 없이 되는 방법을 차례로 시도하고, 다 안 되면 텔레그램으로 알린다."""
@@ -324,6 +419,8 @@ class Bot:
         for s in ready:
             self._intraday(s, prices[s.market], bars[s.id])
 
+        self._check_alerts(prices)
+        self._check_pi()
         self._refresh_exchange()
         self._refresh_market_info()
         self._write_status(day)
