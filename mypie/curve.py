@@ -75,8 +75,8 @@ def coin(db: Database, status: dict, slot_id: str) -> dict:
     return build(trades, bars, x.get("price"))
 
 
-def stock(db: Database, status: dict, slot_id: str, regular_tf: str) -> dict:
-    """주식 계좌: 정규장 일봉으로 (봉은 그날 15:30에 끝난다)."""
+def stock(db: Database, status: dict, slot_id: str, day_tf: str) -> dict:
+    """주식 계좌: 일봉으로 (KRX·NXT 통합이라 봉은 그날 20:00에 끝난다)."""
     x = next((s for s in (status or {}).get("slots", []) if s["id"] == slot_id), None)
     if not x:
         return {"start": None, "points": []}
@@ -84,5 +84,5 @@ def stock(db: Database, status: dict, slot_id: str, regular_tf: str) -> dict:
     if not trades:
         return {"start": None, "points": []}
     days = (now_kst().date() - date.fromisoformat(trades[0]["ts"][:10])).days
-    bars = [(f"{b['day']} 15:30:00", b["close"]) for b in db.candle_history(x["symbol"], min(days + 3, 3000), regular_tf)]
+    bars = [(f"{b['day']} 20:00:00", b["close"]) for b in db.candle_history(x["symbol"], min(days + 3, 3000), day_tf)]
     return build(trades, bars, x.get("price"))

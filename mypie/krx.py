@@ -1,8 +1,10 @@
 """한국 주식시장(KRX) 시간 규칙: 장 시간, 휴장일, 호가 단위.
 
 정규장: 09:00 ~ 15:30 KST
-  - 09:00 ~ 15:20  접속매매 (봇이 사고파는 시간)
+  - 09:00 ~ 15:20  접속매매
   - 15:20 ~ 15:30  장 마감 동시호가 (주문은 받지만 체결은 15:30에 한 번) → 봇은 새 주문을 내지 않는다
+정규장 밖 (넥스트레이드 프리마켓 08:00~08:50, 애프터마켓 15:40~20:00, KRX 애프터마켓 16:00~20:00)은
+종목마다 달라서 주식 봇이 정한다 (stockbot.StockBot._spans).
 주말과 휴장일에는 장이 안 열린다. 휴장일 목록은 아래에 적어 두고, 그래도 모르는 휴장일(임시 공휴일 등)은
 봇이 장 시작 때 토스증권 장 달력으로 한 번 더 확인해서 쉰다 (stockbot.StockBot._market_open_today).
 """
@@ -56,17 +58,28 @@ def next_open(now: datetime, extra_holidays: set[str] | frozenset = frozenset())
     return datetime.combine(day, OPEN, KST)
 
 
-def tick_size(price: float) -> int:
-    """호가 단위 (2023년부터 코스피·코스닥 같음)."""
+ETF_TYPES = {"ETF", "ETN", "FOREIGN_ETF"}  # 호가 단위가 따로인 종류 (2,000원 미만 1원, 그 위 5원)
+
+
+def tick_size(price: float, etf: bool = False) -> int:
+    """호가 단위 (2023년부터 코스피·코스닥 같음). ETF·ETN은 2,000원 미만 1원, 그 위는 5원."""
+    if etf:
+        return 1 if price < 2_000 else 5
     for limit, tick in ((2_000, 1), (5_000, 5), (20_000, 10), (50_000, 50), (200_000, 100), (500_000, 500)):
         if price < limit:
             return tick
     return 1_000
 
 
-def round_tick(price: float, up: bool) -> int:
+def tick_fn(security_type: str | None):
+    """종목 종류(STOCK·ETF 등)에 맞는 호가 단위 함수 (시뮬레이션에서 매매마다 한 칸 불리하게 칠 때)."""
+    etf = security_type in ETF_TYPES
+    return lambda price: tick_size(price, etf)
+
+
+def round_tick(price: float, up: bool, etf: bool = False) -> int:
     """가격을 호가 단위에 맞춘다 (up이면 올림, 아니면 내림)."""
-    tick = tick_size(price)
+    tick = tick_size(price, etf)
     steps = -(-price // tick) if up else price // tick
     return int(steps * tick)
 

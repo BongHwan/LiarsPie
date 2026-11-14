@@ -15,7 +15,7 @@ import urllib.request
 import uuid
 
 BASE_URL = "https://api.upbit.com/v1"
-USER_AGENT = "My_Pie/0.2"
+USER_AGENT = "AntLab/0.2"
 
 
 class UpbitError(Exception):

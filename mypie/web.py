@@ -9,6 +9,8 @@
   GET  /api/cpu      코어별 CPU 이용률 (최근 60초, 1초 간격)
   GET  /api/curve    계좌 카드의 작은 그래프: 첫 매매부터 전략 vs 그냥 들고 있었다면 (?kind=coin|stock&slot=s1)
   POST /api/simjob   긴 기간 시뮬레이션 계산 시작·멈춤 {"action": "start", "kind": "coin", "query": "market=..."}
+  GET  /api/search   좋은 조합 찾기: 계산 상태 · 지난 결과(최근 50개) · 고른 조건의 예상 시간 (?kind=coin&id=…&market=…&tf=…&years=…)
+  POST /api/search   좋은 조합 찾기 시작·멈춤 {"action": "start", "kind": "coin", "market": "KRW-BTC", "tf": "240m", "years": 3}
   GET  /api/stats    성과 통계, 종목별 성적, 날짜별 손익
   GET  /api/system   라즈베리파이 상태 (온도, 메모리, 디스크, 전원)
   POST /api/control  포트폴리오(종목·전략·비중)·계좌·한도 변경 (PIN 필요)
@@ -36,8 +38,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import auth, backtest, curve, krx, network, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
-from .stockbot import REGULAR_TF, regular_ready
+from . import auth, backtest, combosearch, curve, krx, network, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
+from .stockbot import DAY_TF, daily_ready, slippage_summary, stock_type
 from .broker import MIN_ORDER_KRW
 from .config import load_config
 from .db import Database
@@ -185,7 +187,7 @@ SIM_CACHE_SIZE = 12
 _sim_lock = threading.Lock()
 _sim_cache: dict[tuple, list[dict]] = {}
 # 주식 시뮬레이션 기간 (일, 이름). 1년에 거래일은 250일쯤이라 봉 개수는 그만큼 줄여서 센다
-STOCK_SIM_PERIODS = [(30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (1095, "3년")]
+STOCK_SIM_PERIODS = [(30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (1095, "3년"), (1825, "5년"), (2920, "8년")]
 
 
 def build_simulation(db_path: str, cfg: dict, market: str, tf: str, days: int, strategy: str,
@@ -209,20 +211,21 @@ def build_stock_simulation(db_path: str, cfg: dict, symbol: str, days: int, stra
     if not STOCK_SYMBOL.match(symbol):
         return {"market": symbol, "tf": "1d", "days": days, "periods": [], "ready": False, "message": "잘못된 종목이에요."}
     db = _open(db_path)
-    try:  # 봇은 정규장(09:00~15:30)에서만 사고팔아서, 정규장 일봉이 다 만들어진 뒤에 계산한다
-        ready = bool(db) and regular_ready(db, symbol)
+    try:  # 일봉(KRX·NXT 통합)이 아직 없으면 주식 봇이 받아 올 때까지 기다린다
+        ready = bool(db) and daily_ready(db, symbol)
+        security = stock_type(db, symbol) if db else None  # 호가 단위가 ETF·ETN은 따로
     finally:
         if db:
             db.close()
     if not ready:
         return {"market": symbol, "tf": "1d", "days": days, "periods": [], "ready": False, "need_data": True,
-                "message": "정규장 일봉을 만드는 중이에요 (처음 고른 종목은 몇 분 걸려요)"}
+                "message": "일봉을 받아 오는 중이에요 (처음 고른 종목은 1분쯤 걸려요)"}
     sc = cfg["stock"]
-    return _simulate(db_path, symbol, "1d", days, strategy, periods=STOCK_SIM_PERIODS, bars_tf=REGULAR_TF,
+    return _simulate(db_path, symbol, "1d", days, strategy, periods=STOCK_SIM_PERIODS, bars_tf=DAY_TF,
                      bars_of=lambda d: d * 250 // 365, strategies=STOCK_STRATEGIES, fee=float(sc["fee_rate"]),
                      sell_cost=float(sc["sell_tax"]), rank_by=sc.get("rank_by", "return"), per_year=250, cfg=cfg,
                      is_stale=lambda last: last < krx.previous_trading_day(now_kst().date()).isoformat(), rule=rule,
-                     stop_loss=stop_loss, kind="stock")
+                     stop_loss=stop_loss, kind="stock", tick=krx.tick_fn(security))
 
 
 def _query_stop(query: dict) -> float:
@@ -244,8 +247,9 @@ def _query_rule(query: dict, registry: dict) -> dict | None:
 
 def _simulate(db_path: str, market: str, tf: str, days: int, strategy: str, *, periods, bars_of, strategies: dict,
               fee: float, sell_cost: float, rank_by: str, per_year: float, cfg: dict, is_stale,
-              rule: dict | None = None, stop_loss: float = 0.0, bars_tf: str | None = None, kind: str = "coin") -> dict:
-    """bars_tf: 계산에 쓰는 봉 (주식은 정규장 일봉). 없으면 tf.
+              rule: dict | None = None, stop_loss: float = 0.0, bars_tf: str | None = None, kind: str = "coin",
+              tick=None) -> dict:
+    """bars_tf: 계산에 쓰는 봉 (주식은 KRX·NXT 통합 일봉). 없으면 tf. tick: 주식의 호가 한 칸 (매매마다 한 칸 불리하게).
     긴 기간(simulation.is_long)은 여기서 바로 계산하지 않는다: 따로 계산한 결과가 있으면 그걸, 없으면 계산 작업 안내를 준다."""
     out = {"market": market, "tf": tf, "days": days, "periods": [], "ready": False}
     db = _open(db_path)
@@ -260,10 +264,8 @@ def _simulate(db_path: str, market: str, tf: str, days: int, strategy: str, *, p
     finally:
         db.close()
 
-    def ok(d: int) -> bool:  # 코인의 긴 기간은 계산 작업이 모자란 봉을 받아 오니 언제든 고를 수 있다
-        if long_(d):
-            return kind == "coin" or stored - bars_of(d) >= backtest.WARMUP
-        return len(candles) - bars_of(d) >= backtest.WARMUP
+    def ok(d: int) -> bool:  # 긴 기간은 계산 작업이 모자란 봉을 받고, 그래도 모자라면 있는 만큼으로 계산하니 언제든 고를 수 있다
+        return long_(d) or len(candles) - bars_of(d) >= backtest.WARMUP
 
     out["periods"] = [{"days": d, "label": label, "ok": ok(d), "long": long_(d)} for d, label in periods]
     if long_(days) and ok(days):
@@ -283,7 +285,8 @@ def _simulate(db_path: str, market: str, tf: str, days: int, strategy: str, *, p
         results = _sim_cache.get(key)
         if results is None:
             params = {name: strategy_params(cfg, name) for name in strategies}
-            results = backtest.rank_period(candles, bars, fee, rank_by, per_year, params, sell_cost, strategies, stop_loss)
+            results = backtest.rank_period(candles, bars, fee, rank_by, per_year, params, sell_cost, strategies, stop_loss,
+                                           tick=tick)
             _sim_cache[key] = results
             while len(_sim_cache) > SIM_CACHE_SIZE:
                 _sim_cache.pop(next(iter(_sim_cache)))
@@ -297,7 +300,7 @@ def _simulate(db_path: str, market: str, tf: str, days: int, strategy: str, *, p
                 warm = min(history, len(candles) - bars)
                 combo = {"name": "combo", "label": made.label,
                          **backtest.simulate(made, candles[-(bars + warm):], fee, warm, per_year, True, sell_cost,
-                                            stop_loss)}
+                                            stop_loss, tick=tick)}
                 ranked = sorted([r for r in results] + [combo], key=lambda r: backtest.score(r, rank_by), reverse=True)
                 combo["rank"] = next(i for i, r in enumerate(ranked, 1) if r is combo)
                 _sim_cache[ckey] = combo
@@ -308,7 +311,7 @@ def _simulate(db_path: str, market: str, tf: str, days: int, strategy: str, *, p
             if hold is None:
                 warm = min(history, len(candles) - bars)
                 hold = _sim_cache[hkey] = backtest.simulate(strategies["buy_and_hold"](None), candles[-(bars + warm):],
-                                                            fee, warm, per_year, True, sell_cost)
+                                                            fee, warm, per_year, True, sell_cost, tick=tick)
     window = candles[-bars:]
     chosen = combo or next((r for r in results if r["name"] == strategy), results[0])
     hold = hold or chosen
@@ -376,8 +379,7 @@ def simjob_request(main_db: str, stock_db: str, cfg: dict, data: dict) -> tuple[
         return 400, {"ok": False, "message": "봇이 아직 시작되지 않았어요."}
     try:
         stored = db.candle_range(market, ctx["bars_tf"])[0]
-        if kind == "stock" and not regular_ready(db, market):
-            return 400, {"ok": False, "message": "정규장 일봉을 만드는 중이에요. 잠시 뒤 다시 해 주세요."}
+        security = stock_type(db, market) if kind == "stock" else None
     finally:
         db.close()
     base_key, combo_key = simulation.keys(kind, market, tf, days, stop, now_kst().date().isoformat(), rule)
@@ -385,9 +387,104 @@ def simjob_request(main_db: str, stock_db: str, cfg: dict, data: dict) -> tuple[
     missing = max(0, bars + ctx["history"] - stored) if kind == "coin" else 0
     spec = {"id": combo_key or base_key, "kind": kind, "db": str(Path(db_path).resolve()), "market": market, "tf": tf,
             "days": days, "bars": bars, "rule": rule if combo_key else None, "stop_loss": stop,
-            "base_key": base_key, "combo_key": combo_key, "results": str(results.resolve()),
+            "base_key": base_key, "combo_key": combo_key, "results": str(results.resolve()), "security_type": security,
             "label": f"{market} · {timeframes.TIMEFRAMES[tf]['short'] if kind == 'coin' else '일봉'} · {label}",
             "estimate_sec": simulation.estimate(ctx, bars, rule, missing, (results / f"{base_key}.json").exists())}
+    started, state = simjob.start(folder, spec)
+    if not started:
+        return 409, {"ok": False, "busy": True, "job": state,
+                     "message": f"다른 계산({state.get('label')})이 진행 중이에요. 멈추거나 끝난 뒤에 시작해 주세요."}
+    return 200, {"ok": True, "job": state}
+
+
+# ---- 좋은 조합 찾기 (combosearch.py): 계산은 긴 시뮬레이션과 같은 계산 작업 자리(한 번에 하나)를 쓴다 ----
+
+def _search_target(main_db: str, stock_db: str, cfg: dict, kind: str, market: str, tf: str, years: int) -> tuple[dict | None, str]:
+    """고른 조건을 확인하고 계산에 쓸 값들을 만든다. (값, 문제)."""
+    if kind == "coin" and (not MARKET_PATTERN.match(market) or tf not in timeframes.TIMEFRAMES):
+        return None, "잘못된 종목이에요."
+    if kind == "stock" and not STOCK_SYMBOL.match(market):
+        return None, "잘못된 종목이에요."
+    if years not in combosearch.YEARS or years > combosearch.MAX_YEARS.get(tf, max(combosearch.YEARS)):
+        return None, "그 기간은 고를 수 없어요."
+    db_path = main_db if kind == "coin" else stock_db
+    db = _open(db_path)
+    if not db:
+        return None, "봇이 아직 시작되지 않았어요."
+    try:
+        ctx = simulation.context(kind, cfg, tf, 0.0)
+        stored = db.candle_range(market, ctx["bars_tf"])[0]
+        if kind == "coin":
+            name = next((m.get("name") for m in (db.get_state("markets") or {}).get("list", []) if m["market"] == market), None)
+        else:
+            security = stock_type(db, market)
+            name = next((s["name"] for s in (db.get_state("status") or {}).get("slots", []) if s["symbol"] == market), None) \
+                or next((s["name"] for s in (db.get_state("stocks") or {}).get("list", []) if s["symbol"] == market), None)
+    finally:
+        db.close()
+    bars = simulation.bars_of(kind, tf, years * 365)
+    missing = max(0, bars + ctx["history"] - stored) if kind == "coin" else 0
+    return {"db": str(Path(db_path).resolve()), "name": name or market, "bars": bars,
+            "security_type": security if kind == "stock" else None,
+            "tf_label": timeframes.TIMEFRAMES[tf]["short"] if kind == "coin" else "일봉",
+            "estimate_sec": round(combosearch.estimate(bars, len(ctx["strategies"]), simulation.WORKERS, missing)),
+            "fetch_bars": missing}, ""
+
+
+def build_search(main_db: str, stock_db: str, cfg: dict, query: dict) -> dict:
+    """계산 상태, 지난 결과 목록(최근 것부터), 보여 줄 결과 하나(고른 것, 없으면 마지막), 고른 조건의 예상 시간."""
+    first = lambda key, default="": query.get(key, [default])[0]
+    kind = "stock" if first("kind") == "stock" else "coin"
+    if first("only") == "estimate":  # 고르는 칸을 바꿀 때마다: 예상 시간만 (지난 결과 파일은 크다)
+        try:
+            years = int(first("years", "0") or 0)
+        except ValueError:
+            years = 0
+        target, problem = _search_target(main_db, stock_db, cfg, kind, first("market"), first("tf", "1d"), years)
+        return {"estimate": {"sec": target["estimate_sec"], "fetch_bars": target["fetch_bars"]} if target else {"problem": problem}}
+    folder = simulation.folder(main_db)
+    items = (simulation.load(folder / combosearch.history_file(kind)) or {}).get("items", [])
+    chosen = next((r for r in items if r["id"] == first("id")), items[0] if items else None)
+    out = {"kind": kind, "job": simjob.read_state(folder), "result": chosen,
+           "history": [{k: r.get(k) for k in ("id", "name", "market", "tf_label", "years", "computed_at", "saved")} for r in items],
+           "years": list(combosearch.YEARS), "max_years": combosearch.MAX_YEARS, "top": combosearch.TOP,
+           "recent": combosearch.RECENT, "saved_max": combosearch.SAVED}
+    return out
+
+
+def search_request(main_db: str, stock_db: str, cfg: dict, data: dict) -> tuple[int, dict]:
+    """좋은 조합 찾기 시작·멈춤, 결과 ⭐ 저장·빼기."""
+    folder = simulation.folder(main_db)
+    action = data.get("action")
+    if action == "stop":
+        return 200, {"ok": True, "job": simjob.stop(folder)}
+    if action in ("save", "unsave"):
+        kind = "stock" if data.get("kind") == "stock" else "coin"
+        path = folder / combosearch.history_file(kind)
+        items = (simulation.load(path) or {}).get("items", [])
+        item = next((r for r in items if r["id"] == str(data.get("id", ""))), None)
+        if not item:
+            return 404, {"ok": False, "message": "그 결과를 찾지 못했어요."}
+        if action == "save" and not item.get("saved") and sum(1 for r in items if r.get("saved")) >= combosearch.SAVED:
+            return 400, {"ok": False, "message": f"저장은 {combosearch.SAVED}개까지예요. 안 쓰는 걸 먼저 빼 주세요."}
+        item["saved"] = action == "save"
+        simulation.save(path, {"items": combosearch.keep(items)})
+        return 200, {"ok": True, "message": "⭐ 저장했어요" if action == "save" else "저장에서 뺐어요"}
+    if action != "start":
+        return 400, {"ok": False, "message": "잘못된 요청이에요."}
+    kind = "stock" if data.get("kind") == "stock" else "coin"
+    market, tf = str(data.get("market", ""))[:20], (str(data.get("tf") or "1d") if kind == "coin" else "1d")
+    try:
+        years = int(data.get("years") or 0)
+    except (TypeError, ValueError):
+        years = 0
+    target, problem = _search_target(main_db, stock_db, cfg, kind, market, tf, years)
+    if not target:
+        return 400, {"ok": False, "message": problem}
+    spec = {"task": "search", "id": f"search-{kind}-{market}-{tf}-{years}-{int(time.time())}", "kind": kind,
+            "market": market, "tf": tf, "years": years,
+            "label": f"🔍 {target['name']} · {target['tf_label']} · {years}년 좋은 조합 찾기",
+            **{k: target[k] for k in ("db", "name", "bars", "tf_label", "estimate_sec", "security_type")}}
     started, state = simjob.start(folder, spec)
     if not started:
         return 409, {"ok": False, "busy": True, "job": state,
@@ -433,6 +530,7 @@ def build_stock_payload(stock_db: str, main_db: str) -> dict:
         mode = (status or {}).get("mode", "paper")
         payload["status"] = status
         payload["trades"] = [t for t in db.recent_trades(60) if t["mode"] == mode][:30]
+        payload["slippage"] = slippage_summary(db, mode)  # 계획 가격 대비 실제 체결 (호가 몇 칸 불리했나)
         payload["events"] = db.recent_events(40)
         payload["equity"] = db.equity_since(mode, ts(now_kst() - timedelta(days=EQUITY_DAYS)))
         payload["rankings"] = _slim_rankings(db.get_state("rankings") or {})
@@ -492,7 +590,7 @@ _intraday_cache: dict[tuple, tuple[float, dict]] = {}
 
 def build_stock_intraday(stock_db: str, symbol: str, span: str) -> dict:
     """주식 차트 1일·1주: 토스증권에서 1분봉을 받아 5분·30분봉으로 묶는다.
-    넥스트레이드 장 전·후까지 08:00~20:00을 보여준다 (봇이 사고파는 건 정규장 09:00~15:20뿐).
+    넥스트레이드 장 전·후까지 08:00~20:00을 보여준다 (봇도 그 종목이 거래되는 시간 전체에서 사고판다).
     토큰은 주식 봇 DB에 저장된 것을 같이 쓰고, 같은 차트는 1분 동안 다시 받지 않는다."""
     out = {"symbol": symbol, "span": span, "intraday": True, "candles": [], "trades": []}
     if not STOCK_SYMBOL.match(symbol) or span not in INTRADAY_SPANS:
@@ -941,7 +1039,7 @@ def build_curve(db_path: str, stock_db_path: str, kind: str, slot: str) -> dict:
     try:
         status = db.get_state("status")
         if kind == "stock":
-            return curve.stock(db, status, slot, REGULAR_TF)
+            return curve.stock(db, status, slot, DAY_TF)
         return curve.coin(db, status, slot)
     finally:
         db.close()
@@ -1273,7 +1371,7 @@ def telegram_link() -> tuple[int, dict]:
         write_env({telegram.TOKEN: token, telegram.CHAT: str(chat), BOT_NAME_KEY: bot,
                    PENDING_TOKEN: "", PENDING_BOT: "", PENDING_UNTIL: ""})
     try:
-        telegram.send("🥧 My_Pie와 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.")
+        telegram.send("🐜 AntLab과 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.")
     except telegram.TelegramError:
         pass
     return 200, {"ok": True, "linked": True, "message": f"@{bot} 연결 완료! 텔레그램을 확인해 보세요."}
@@ -1287,7 +1385,7 @@ def telegram_action(db_path: str, data: dict) -> tuple[int, dict]:
     action = data.get("action")
     if action == "test":
         try:
-            telegram.send("🥧 My_Pie 테스트 메시지예요. 잘 오고 있어요!")
+            telegram.send("🐜 AntLab 테스트 메시지예요. 잘 오고 있어요!")
         except telegram.TelegramError as e:
             return 502, {"ok": False, "message": f"보내지 못했어요 ({e})"}
         return 200, {"ok": True, "message": "테스트 메시지를 보냈어요."}
@@ -1403,7 +1501,7 @@ def login_verify(db_path: str, code: str, hours: float, client: dict, trust_hour
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MyPie"
+    server_version = "AntLab"
     db_path = ""
     stock_db_path = ""
     login_enabled = True
@@ -1441,7 +1539,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         route, query = url.path, parse_qs(url.query)
-        if route in ("/app.css", "/rules.js", "/curve.js", "/pi.js", "/simjob.js", "/settings.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
+        if route in ("/app.css", "/rules.js", "/tabs.js", "/curve.js", "/slotnums.js", "/finder.js", "/pi.js", "/simjob.js", "/settings.js", "/theme.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
             kind = "text/css" if route.endswith(".css") else "text/javascript"
             self._send(200, (STATIC_DIR / route[1:]).read_bytes(), kind + "; charset=utf-8")
             return
@@ -1473,6 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                                                       query.get("strategy", [""])[0], _query_rule(query, STRATEGIES),
                                                       _query_stop(query)),
             "/api/simjob": lambda: {"job": simjob.read_state(simulation.folder(self.db_path))},
+            "/api/search": lambda: build_search(self.db_path, self.stock_db_path, self.cfg, query),
             "/api/cpu": cpu_sampler.snapshot,
             "/api/curve": lambda: build_curve(self.db_path, self.stock_db_path, query.get("kind", ["coin"])[0],
                                               query.get("slot", [""])[0][:40]),
@@ -1506,7 +1605,7 @@ class Handler(BaseHTTPRequestHandler):
         public = ("/api/login/send", "/api/login/verify", "/api/login/wait")
         private = ("/api/control", "/api/ranking", "/api/logout",
                    "/api/telegram/start", "/api/telegram/link", "/api/telegram/action",
-                   "/api/stock/control", "/api/stock/ranking", "/api/simjob", "/api/pin", "/api/keys")
+                   "/api/stock/control", "/api/stock/ranking", "/api/simjob", "/api/search", "/api/pin", "/api/keys")
         if route not in public + private:
             self._send(404, b"not found", "text/plain")
             return
@@ -1535,6 +1634,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, body = save_broker_keys(self.db_path, data, self._client()["ip"])
             elif route == "/api/simjob":
                 code, body = simjob_request(self.db_path, self.stock_db_path, self.cfg, data)
+            elif route == "/api/search":
+                code, body = search_request(self.db_path, self.stock_db_path, self.cfg, data)
             elif route == "/api/stock/ranking":
                 code, message = request_stock_ranking(self.stock_db_path, str(data.get("symbol", "")))
                 body = {"ok": code == 200, "message": message}

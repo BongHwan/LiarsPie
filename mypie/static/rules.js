@@ -12,6 +12,10 @@ function normalizeRule(r) {
 }
 function isSimpleRule(r) { return r.buy.length === 1 && r.sell.length === 1 && r.buy[0] === r.sell[0]; }
 function sameRule(a, b) { return JSON.stringify(normalizeRule(a)) === JSON.stringify(normalizeRule(b)); }
+function sameCombo(a, b) {  // 그리고·또는은 순서가 상관없어서, 순서만 다른 조합도 같은 조합으로 본다
+  const key = (r) => { r = normalizeRule(r); return JSON.stringify([[...r.buy].sort(), r.buy_op, [...r.sell].sort(), r.sell_op]); };
+  return key(a) === key(b);
+}
 function ruleText(r, labelOf) {
   r = normalizeRule(r);
   if (isSimpleRule(r)) return labelOf(r.buy[0]);
@@ -116,8 +120,8 @@ function stopField(pct, onChange) {
     if (p > 0) num.value = p;
     num.disabled = !on.checked;
   };
-  box.append(el('label', { class: 'toggle' }, on, el('span', { class: 'rule-tag stop', text: '손절선' })),
-             el('span', { text: '산 값보다 −' }), num, el('span', { text: '% 떨어지면 팔기' }));
+  box.append(el('label', { class: 'toggle' }, on, el('span', { class: 'rule-tag stop', text: '손절선' })),  // 좁으면 뒷부분이 통째로 다음 줄로
+             el('span', { class: 'stop-rest' }, el('span', { text: '산 값보다 −' }), num, el('span', { text: '% 떨어지면 팔기' })));
   return box;
 }
 function stopText(pct) { return pct > 0 ? `손절선 −${pct}%` : ''; }

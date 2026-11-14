@@ -21,13 +21,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from mypie import (alerts, auth, backtest, curve, indicators, keys, krx, network, pin, reports, simjob, simulation, sshwatch, stoploss,
+from mypie import (alerts, auth, backtest, combosearch, curve, indicators, keys, krx, network, pin, reports, simjob, simulation,
+                   sshwatch, stoploss,
                    telegram, timeframes, toss, upbit, web)
 from mypie.bot import Bot, check_account
 from mypie.broker import Book, LiveExecutor, PaperExecutor, migrate_book
 from mypie.config import DEFAULTS
 from mypie.db import Database
-from mypie.strategies import STRATEGIES, create_strategy, strategy_params
+from mypie.strategies import STOCK_STRATEGIES, STRATEGIES, create_strategy, strategy_params
 from mypie.strategies.base import DayPlan, Strategy, render_text
 from mypie.strategies.combo import check_rule, make_rule, normalize_rule, rule_fields
 from mypie.timeutil import KST, trading_day
@@ -1179,8 +1180,8 @@ class WebTest(TempDbTest):
         self.assertEqual((sim["days"], sim["detail"]["name"], len(sim["detail"]["close"])), (90, "rsi", 90))
         self.assertEqual(len(sim["results"]), len(STRATEGIES))
         self.assertNotIn("detail", sim["results"][0])
-        self.assertEqual([p["ok"] for p in sim["periods"]], [True, True, True, False, True])  # 1년은 봉이 모자람
-        self.assertEqual([p["long"] for p in sim["periods"]], [False, False, False, False, True])  # 3년은 따로 계산 (봉은 그때 받는다)
+        self.assertEqual([p["ok"] for p in sim["periods"]], [True, True, True, False, True, True, True])  # 1년은 봉이 모자람
+        self.assertEqual([p["long"] for p in sim["periods"]], [False, False, False, False, True, True, True])  # 3·5·8년은 따로 계산 (봉은 그때 받는다)
         self.assertTrue(sim["stale"])                                   # 마지막 봉이 오래전
         self.assertEqual(web.build_simulation(self.path, cfg, "KRW-ETH", "1d", 365, "")["days"], 180)  # 되는 기간 중 가장 긴 것
         long = web.build_simulation(self.path, cfg, "KRW-ETH", "1d", 1095, "")
@@ -1236,6 +1237,67 @@ class LongSimulationTest(TempDbTest):
                 "bars": 1095, "rule": rule, "stop_loss": stop, "base_key": base, "combo_key": combo, "label": "ETH 3년",
                 "workers": 2}  # 리눅스(파이)에서는 CPU 둘에 나눠서, 윈도에서는 한 프로세스에서
 
+    def test_combo_search_matches_the_simulation_and_keeps_history(self):
+        """좋은 조합 찾기: 전략·쪽마다 한 번만 계산해도 진짜 시뮬레이션(make_rule + simulate)과 결과가 같다.
+        결과는 최근 것부터 쌓이고, 오래 걸린 건 텔레그램 요약도 만든다."""
+        candles = self.db.candle_history("KRW-ETH", 1300, "1d")
+        ctx = simulation.context("coin", self.cfg, "1d", 5.0)
+        out = combosearch.search(candles, 900, ctx)
+        self.assertEqual(out["count"], 36 * 36)                               # 상위 6개를 한쪽에 하나·둘(그리고·또는)로
+        same = [(round(r["total_return"], 9), round(r["mdd"], 9), r["trades"]) for r in out["results"]]
+        self.assertEqual(len(same), len(set(same)))                           # 결과가 똑같은 조합은 하나만 (나머지는 개수로)
+        make = lambda n: create_strategy(n, ctx["params"][n])
+        for r in out["results"][:3] + out["results"][-2:] + [{"rule": normalize_rule({"strategy": out["top"][0]}), **out["singles"][0]}]:
+            real = backtest.simulate(make_rule(r["rule"], make), candles, ctx["fee"], len(candles) - 900, stop_loss=5.0)
+            self.assertAlmostEqual(real["total_return"], r["total_return"], places=4)
+            self.assertAlmostEqual(real["mdd"], r["mdd"], places=4)
+            self.assertEqual(real["trades"], r["trades"])
+        stock = simulation.context("stock", self.cfg, "1d", 0.0, "STOCK")         # 주식: 매매마다 호가 한 칸 불리하게
+        found = combosearch.search(candles, 900, stock)
+        smake = lambda n: create_strategy(n, stock["params"][n], STOCK_STRATEGIES)
+        for r in found["results"][:2]:
+            real = backtest.simulate(make_rule(r["rule"], smake), candles, stock["fee"], len(candles) - 900,
+                                     sell_cost=stock["sell_cost"], tick=stock["tick"])
+            self.assertAlmostEqual(real["total_return"], r["total_return"], places=4)
+            self.assertEqual(real["trades"], r["trades"])
+        plain = backtest.simulate(make_rule(found["results"][0]["rule"], smake), candles, stock["fee"], len(candles) - 900,
+                                  sell_cost=stock["sell_cost"])
+        if found["results"][0]["trades"]:
+            self.assertLess(found["results"][0]["total_return"], plain["total_return"])  # 한 칸씩 손해 본 만큼 낮다
+        self.assertEqual((krx.tick_size(27_315), krx.tick_size(27_315, etf=True)), (50, 5))  # ETF는 호가 단위가 따로
+        spec = {"task": "search", "id": "search-coin-KRW-ETH-1d-3-", "kind": "coin", "db": self.path, "market": "KRW-ETH",
+                "name": "이더리움", "tf": "1d", "tf_label": "일봉", "years": 3, "bars": 1095, "label": "🔍", "workers": 1}
+        with mock.patch.object(simjob, "_fetch"), mock.patch.object(combosearch, "RECENT", 2):
+            for n in (1, 2, 3):
+                self.assertEqual(simjob.run({**spec, "id": f"{spec['id']}{n}"}, self.folder, self.cfg), "done")
+        page = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})
+        self.assertEqual([h["id"] for h in page["history"]], [spec["id"] + "3", spec["id"] + "2"])  # 최근 것부터, 정한 개수까지
+        self.assertEqual((page["result"]["id"], page["result"]["bars"]), (spec["id"] + "3", 1095))
+        self.assertIn("좋은 조합 찾기 끝 · 이더리움 일봉 3년", combosearch.telegram_text(page["result"]))
+        older = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"], "id": [spec["id"] + "2"]})
+        self.assertEqual(older["result"]["id"], spec["id"] + "2")
+        save = lambda action, n: web.search_request(self.path, "/no/such.db", self.cfg, {"action": action, "kind": "coin", "id": spec["id"] + n})
+        self.assertEqual(save("save", "2")[0], 200)                            # ⭐ 저장한 건 최근 몇 개에서 밀려나도 남는다
+        with mock.patch.object(simjob, "_fetch"), mock.patch.object(combosearch, "RECENT", 2):
+            for n in ("4", "5"):
+                simjob.run({**spec, "id": spec["id"] + n}, self.folder, self.cfg)
+        page = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})
+        self.assertEqual([(h["id"][-1], bool(h["saved"])) for h in page["history"]], [("5", False), ("4", False), ("2", True)])
+        self.assertEqual(save("unsave", "2")[0], 200)
+        self.assertEqual(save("save", "nope")[0], 404)
+        short = {**spec, "id": spec["id"] + "s", "bars": 5000}                 # 데이터가 모자라면 있는 만큼으로
+        with mock.patch.object(simjob, "_fetch"):
+            self.assertEqual(simjob.run(short, self.folder, self.cfg), "done")
+        r = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})["result"]
+        self.assertTrue(r["short"])
+        self.assertEqual(r["bars"], 1300 - backtest.WARMUP)
+        ask = lambda **d: web.search_request(self.path, "/no/such.db", self.cfg, {"action": "start", "kind": "coin", **d})[0]
+        self.assertEqual(ask(market="KRW-ETH", tf="15m", years=8), 400)       # 15분봉은 2년까지
+        self.assertEqual(ask(market="KRW-ETH", tf="1d", years=4), 400)        # 고를 수 있는 기간만
+        est = web.build_search(self.path, "/no/such.db", self.cfg,
+                               {"kind": ["coin"], "only": ["estimate"], "market": ["KRW-ETH"], "tf": ["1d"], "years": ["3"]})
+        self.assertGreater(est["estimate"]["sec"], 0)
+
     def test_job_computes_once_and_page_reads_the_saved_result(self):
         with mock.patch.object(upbit, "get_candles", return_value=[]):
             self.assertEqual(simjob.run(self.spec(), self.folder, self.cfg), "done")
@@ -1272,10 +1334,17 @@ class LongSimulationTest(TempDbTest):
         with mock.patch.object(upbit, "get_candles", return_value=[]):
             self.assertEqual(simjob.run(self.spec(), self.folder, self.cfg), "stopped")
         self.assertFalse((self.folder / simjob.STOP).exists())
-        spec = {**self.spec(), "days": 3650, "bars": 3650}               # 상장 이후 봉이 모자라면 알려 준다
+        spec = {**self.spec(), "days": 3650, "bars": 3650}               # 상장 이후 봉이 모자라면 있는 만큼으로
         with mock.patch.object(upbit, "get_candles", return_value=[]):
-            self.assertEqual(simjob.run(spec, self.folder, self.cfg), "error")
-        self.assertIn("1300봉뿐", simjob.read_state(self.folder)["message"])
+            self.assertEqual(simjob.run(spec, self.folder, self.cfg), "done")
+        base = simulation.load(self.folder / f"{spec['base_key']}.json")
+        self.assertEqual((base["bars"], base["short"]), (1300 - backtest.WARMUP, True))
+        sim = simulation.assemble({}, base, None, "rsi", "return", 0)
+        self.assertTrue(sim["short"])
+        empty = {**spec, "market": "KRW-XRP", "base_key": "none"}       # 봉이 거의 없으면 못 한다
+        with mock.patch.object(upbit, "get_candles", return_value=[]), mock.patch.object(simjob, "sync_candles"):
+            self.assertEqual(simjob.run(empty, self.folder, self.cfg), "error")
+        self.assertIn("봉이 0개뿐", simjob.read_state(self.folder)["message"])
 
     def test_requests_are_checked_and_one_job_runs_at_a_time(self):
         req = lambda **d: web.simjob_request(self.path, self.path, self.cfg, d)

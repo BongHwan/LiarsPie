@@ -13,10 +13,11 @@ def ema_series(values: list[float], n: int) -> list[float]:
     if n <= 0 or len(values) < n:
         return []
     k = 2 / (n + 1)
+    k1 = 1 - k
     e = sum(values[:n]) / n
     out = [e]
     for v in values[n:]:
-        e = v * k + e * (1 - k)
+        e = v * k + e * k1
         out.append(e)
     return out
 
@@ -28,13 +29,19 @@ def rsi(closes: list[float], n: int = 14) -> float | None:
     gain = loss = 0.0
     for i in range(1, n + 1):
         d = closes[i] - closes[i - 1]
-        gain += max(d, 0.0)
-        loss += max(-d, 0.0)
-    avg_gain, avg_loss = gain / n, loss / n
-    for i in range(n + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        avg_gain = (avg_gain * (n - 1) + max(d, 0.0)) / n
-        avg_loss = (avg_loss * (n - 1) + max(-d, 0.0)) / n
+        if d > 0:
+            gain += d
+        else:
+            loss -= d
+    avg_gain, avg_loss, m = gain / n, loss / n, n - 1
+    prev = closes[n]
+    for x in closes[n + 1:]:
+        d = x - prev
+        prev = x
+        if d > 0:
+            avg_gain, avg_loss = (avg_gain * m + d) / n, (avg_loss * m + 0.0) / n
+        else:
+            avg_gain, avg_loss = (avg_gain * m + 0.0) / n, (avg_loss * m - d) / n
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
     return 100 - 100 / (1 + avg_gain / avg_loss)
@@ -77,20 +84,19 @@ def stochastic(highs: list[float], lows: list[float], closes: list[float],
 
 def true_ranges(highs: list[float], lows: list[float], closes: list[float]) -> list[float]:
     """True Range 시계열: 그 봉의 고가−저가와, 직전 종가에서 고가·저가까지 거리 중 가장 큰 값 (첫 봉은 고가−저가)."""
-    out = [highs[0] - lows[0]] if closes else []
-    for i in range(1, len(closes)):
-        out.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-    return out
+    if not closes:
+        return []
+    return [highs[0] - lows[0]] + [max(h - lo, abs(h - pc), abs(lo - pc)) for h, lo, pc in zip(highs[1:], lows[1:], closes)]
 
 
 def rma_series(values: list[float], n: int) -> list[float]:
     """와일더 이동평균 시계열 (ATR에 쓰는 방식). 첫 값은 앞 n개의 단순 평균, [0]은 values[n-1] 자리."""
     if n <= 0 or len(values) < n:
         return []
-    r = sum(values[:n]) / n
+    r, m = sum(values[:n]) / n, n - 1
     out = [r]
     for v in values[n:]:
-        r = (r * (n - 1) + v) / n
+        r = (r * m + v) / n
         out.append(r)
     return out
 

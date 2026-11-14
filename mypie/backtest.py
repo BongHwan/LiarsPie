@@ -15,10 +15,13 @@ CURVE_POINTS = 80    # 화면에 그릴 자산 곡선 점 개수
 
 
 # 전략 시뮬레이션에서 고를 수 있는 기간 (일, 이름). 긴 기간은 웹 서버가 따로 계산 작업을 띄운다 (simjob.py)
+# 15분봉은 8년이면 봉이 28만 개라 파이 3B에선 너무 무거워서 3년까지
 SIM_PERIODS = {
-    "1d":   [(30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (1095, "3년")],
-    "240m": [(7, "1주"), (30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (730, "2년"), (1095, "3년")],
-    "60m":  [(7, "1주"), (14, "2주"), (30, "1달"), (60, "2달"), (180, "6달"), (365, "1년"), (1095, "3년")],
+    "1d":   [(30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (1095, "3년"), (1825, "5년"), (2920, "8년")],
+    "240m": [(7, "1주"), (30, "1달"), (90, "3달"), (180, "6달"), (365, "1년"), (730, "2년"), (1095, "3년"), (1825, "5년"),
+             (2920, "8년")],
+    "60m":  [(7, "1주"), (14, "2주"), (30, "1달"), (60, "2달"), (180, "6달"), (365, "1년"), (1095, "3년"), (1825, "5년"),
+             (2920, "8년")],
     "15m":  [(1, "1일"), (3, "3일"), (7, "1주"), (14, "2주"), (30, "1달"), (90, "3달"), (365, "1년"), (1095, "3년")],
 }
 PROGRESS_EVERY = 256  # 이만큼의 봉마다 진행률을 알린다 (오래 걸리는 계산의 진행 표시·멈춤 확인)
@@ -26,11 +29,13 @@ PROGRESS_EVERY = 256  # 이만큼의 봉마다 진행률을 알린다 (오래 �
 
 def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: int = WARMUP,
              bars_per_year: float = 365, detail: bool = False, sell_cost: float = 0.0, stop_loss: float = 0.0,
-             progress=None) -> dict:
+             progress=None, tick=None) -> dict:
     """candles: 완성된 봉 (오래된 것 → 최신). 시작 자금 1로 계산한다. bars_per_year: 1년에 봉이 몇 개인지 (일봉 365).
     detail이면 줄이지 않은 자산 곡선과 매매 지점(fills: 몇 번째 봉에서 사고팔았나)도 돌려준다.
     stop_loss: 손절선 % (stoploss.py 규칙. 시작가에 산 봉에서도 지킨다).
-    progress(done): 계산한 봉 수를 가끔 알린다. 예외를 올리면 계산을 멈춘다."""
+    progress(done): 계산한 봉 수를 가끔 알린다. 예외를 올리면 계산을 멈춘다.
+    tick(price): 호가 한 칸 (주식). 있으면 살 때는 한 칸 비싸게, 팔 때는 한 칸 싸게 체결됐다고 친다 (실제 주문처럼:
+    바로 체결되려면 반대편 호가에 사고팔아야 한다)."""
     cash, coin, cost = 1.0, 0.0, 0.0
     cut = False  # 손절 뒤 매수 신호가 한 번 꺼질 때까지 시작가 매수를 쉰다
     trade_returns: list[float] = []
@@ -40,11 +45,15 @@ def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: i
 
     def buy(price: float) -> None:
         nonlocal cash, coin, cost
+        if tick:
+            price += tick(price)
         coin, cost, cash = cash / ((1 + fee_rate) * price), cash, 0.0
         fills.append({"i": len(curve), "side": "buy", "price": price})
 
     def sell(price: float, loss: bool = False) -> None:
         nonlocal cash, coin, cost
+        if tick:
+            price = max(price - tick(price), tick(price))
         cash = coin * price * (1 - fee_rate - sell_cost)  # sell_cost: 주식의 증권거래세처럼 팔 때만 붙는 비용
         trade_returns.append(cash / cost - 1)
         fills.append({"i": len(curve), "side": "sell", "price": price, "return": cash / cost - 1,
@@ -112,7 +121,7 @@ def score(result: dict, rank_by: str) -> float:
 def rank_strategies(candles: list[dict], fee_rate: float, rank_by: str = "return", bars_per_year: float = 365,
                     params: dict | None = None, warmup: int = WARMUP, detail: bool = False,
                     sell_cost: float = 0.0, strategies: dict | None = None, stop_loss: float = 0.0,
-                    progress=None) -> list[dict]:
+                    progress=None, tick=None) -> list[dict]:
     """모든 전략을 백테스트해서 순위대로 돌려준다. params: {전략이름: 파라미터}.
     strategies: 전략 목록 (기본은 코인·주식 공통 STRATEGIES, 주식은 STOCK_STRATEGIES). stop_loss: 모두에 같은 손절선 %.
     progress(done): 모든 전략을 통틀어 계산한 봉 수 (전략 수 × 봉 수까지)."""
@@ -123,7 +132,7 @@ def rank_strategies(candles: list[dict], fee_rate: float, rank_by: str = "return
         step = (lambda done, base=k * bars: progress(base + done)) if progress else None
         results.append({"name": name, "label": cls.label, "description": cls.description, "guide": cls.guide,
                         **simulate(strategy, candles, fee_rate, warmup, bars_per_year, detail, sell_cost, stop_loss,
-                                   step)})
+                                   step, tick)})
     results.sort(key=lambda r: score(r, rank_by), reverse=True)
     for rank, r in enumerate(results, 1):
         r["rank"] = rank
@@ -141,11 +150,11 @@ def period_bars(tf_minutes: int, days: int) -> int:
 
 def rank_period(candles: list[dict], bars: int, fee_rate: float, rank_by: str = "return",
                 bars_per_year: float = 365, params: dict | None = None, sell_cost: float = 0.0,
-                strategies: dict | None = None, stop_loss: float = 0.0, progress=None) -> list[dict]:
+                strategies: dict | None = None, stop_loss: float = 0.0, progress=None, tick=None) -> list[dict]:
     """최근 bars개 봉 동안만 굴려 본 순위 (전략 시뮬레이션). 그 앞의 봉은 지표 계산에만 쓴다."""
     history = min(history_needed(strategies), len(candles) - bars)
     if history < WARMUP:
         raise ValueError("이 기간을 시험하기엔 모아 둔 봉이 모자라요")
     return rank_strategies(candles[-(bars + history):], fee_rate, rank_by, bars_per_year, params,
                            warmup=history, detail=True, sell_cost=sell_cost, strategies=strategies, stop_loss=stop_loss,
-                           progress=progress)
+                           progress=progress, tick=tick)

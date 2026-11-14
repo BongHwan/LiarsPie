@@ -13,7 +13,7 @@ import os
 from bisect import bisect_left
 from pathlib import Path
 
-from . import backtest, timeframes
+from . import backtest, krx, timeframes
 from .strategies import STOCK_STRATEGIES, STRATEGIES, strategy_params
 from .strategies.combo import is_simple, make_rule
 
@@ -39,20 +39,21 @@ def is_long(days: int, bars: int) -> bool:
     return bars > LONG_BARS or days >= LONG_DAYS
 
 
-def context(kind: str, cfg: dict, tf: str, stop_loss: float) -> dict:
-    """코인·주식마다 다른 계산 조건: 전략 목록, 수수료·세금, 순위 기준, 1년 봉 수, 계산에 쓰는 봉."""
+def context(kind: str, cfg: dict, tf: str, stop_loss: float, security_type: str | None = None) -> dict:
+    """코인·주식마다 다른 계산 조건: 전략 목록, 수수료·세금, 순위 기준, 1년 봉 수, 계산에 쓰는 봉,
+    호가 한 칸 (주식: 매매마다 한 칸 불리하게 체결됐다고 친다. ETF·ETN은 호가 단위가 따로라 security_type으로)."""
     if kind == "stock":
-        from .stockbot import REGULAR_TF  # 주식은 정규장 일봉으로 계산한다
-
+        # 주식도 일봉 그대로 (KRX·넥스트레이드 통합: 봇이 사고파는 시간 전체와 같다)
         sc = cfg["stock"]
         strategies, fee, sell_cost = STOCK_STRATEGIES, float(sc["fee_rate"]), float(sc["sell_tax"])
-        rank_by, per_year, bars_tf = sc.get("rank_by", "return"), 250, REGULAR_TF
+        rank_by, per_year, bars_tf = sc.get("rank_by", "return"), 250, "1d"
     else:
         strategies, fee, sell_cost = STRATEGIES, float(cfg["paper"]["fee_rate"]), 0.0
         rank_by, per_year, bars_tf = cfg["backtest"]["rank_by"], timeframes.bars_per_year(tf), tf
     return {"strategies": strategies, "params": {name: strategy_params(cfg, name) for name in strategies},
             "fee": fee, "sell_cost": sell_cost, "rank_by": rank_by, "per_year": per_year, "bars_tf": bars_tf,
-            "stop_loss": stop_loss, "history": backtest.history_needed(strategies)}
+            "stop_loss": stop_loss, "history": backtest.history_needed(strategies),
+            "tick": krx.tick_fn(security_type) if kind == "stock" else None}
 
 
 def folder(db_path: str | Path) -> Path:
@@ -61,7 +62,9 @@ def folder(db_path: str | Path) -> Path:
 
 def keys(kind: str, market: str, tf: str, days: int, stop_loss: float, day: str, rule: dict | None) -> tuple[str, str | None]:
     """(모든 전략 결과의 이름, 조합 결과의 이름). 결과는 그날 하루 동안 다시 쓴다."""
-    base = hashlib.sha1(json.dumps([kind, market, tf, days, stop_loss, day]).encode()).hexdigest()[:16]
+    # 주식은 호가 한 칸을 넣고부터 계산이 달라져서 이름도 바꾼다 (그 전에 저장한 결과를 쓰지 않게)
+    base = hashlib.sha1(json.dumps([kind, market, tf, days, stop_loss, day] + (["tick"] if kind == "stock" else []))
+                        .encode()).hexdigest()[:16]
     if not rule or is_simple(rule):
         return base, None
     return base, base + "-" + hashlib.sha1(json.dumps(rule, sort_keys=True).encode()).hexdigest()[:10]
@@ -148,7 +151,8 @@ def _run(item: tuple[int, tuple[str, str | None]]) -> tuple[tuple[str, str | Non
         made, stop = ctx["strategies"]["buy_and_hold"](None), 0.0
     else:
         made = ctx["strategies"][name](ctx["params"].get(name))
-    r = backtest.simulate(made, job["window"], ctx["fee"], job["warm"], ctx["per_year"], True, ctx["sell_cost"], stop, step)
+    r = backtest.simulate(made, job["window"], ctx["fee"], job["warm"], ctx["per_year"], True, ctx["sell_cost"], stop, step,
+                          ctx.get("tick"))
     return (kind, name), {"name": name or kind, "label": made.label, **r}
 
 
@@ -212,6 +216,7 @@ def assemble(out: dict, base: dict, combo: dict | None, strategy: str, rank_by: 
     return {**out, "ready": True, "long": True, "rank_by": rank_by, "stop_loss": stop_loss,
             "hold": {"total_return": base["hold"]["total_return"], "mdd": base["hold"]["mdd"]},
             "from": base["from"], "to": base["to"], "bars": base["bars"], "computed_at": base.get("computed_at"),
+            "short": bool(base.get("short")),
             "results": shown,
             "detail": {"name": chosen, "keys": base["keys"], "close": base["close"], "equity": detail["equity"],
                        "hold": base["hold"]["equity"], "fills": detail["fills"], "holding": detail["holding"]}}

@@ -3,27 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My_Pie</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🥧</text></svg>">
+<title>AntLab</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐜</text></svg>">
 <link rel="stylesheet" href="/app.css">
+<script>try { const t = localStorage.getItem("mypie.theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script><!-- 고른 테마를 그리기 전에 (🎨 버튼, theme.js) -->
 </head>
 <body>
 <div class="wrap">
   <div class="top">
     <div class="top-in">
-      <div class="brand"><span class="logo">🥧</span>My_Pie</div>
+      <div class="brand"><span class="logo">🐜</span>AntLab</div>
       <div class="seg switch"><a href="/" aria-current="page">🪙 코인</a><a href="/stock">📈 주식</a></div>
       <span class="chip" id="modeChip">-</span>
       <span class="chip" id="slotsChip">-</span>
       <div class="top-right">
         <span class="num" id="clock"></span>
         <div class="beat"><span class="dot" id="dot"></span><span id="beat">불러오는 중…</span></div>
+        <span class="theme-wrap"><button type="button" id="themeBtn" class="ghost small gear" aria-label="테마 (화면 색)" aria-haspopup="true" aria-expanded="false" title="테마">🎨</button></span>
         <button type="button" id="gear" class="ghost small gear" aria-label="설정 (텔레그램 · 모의투자/실거래)" title="설정">⚙️</button>
         <button type="button" id="logout" class="ghost small" hidden>로그아웃</button>
       </div>
-      <nav class="jump">
-        <a href="#overview">개요</a><a href="#chart">차트</a><a href="#accounts">계좌</a><a href="#sim">시뮬레이션</a><a href="#guides">전략 설명</a>
-        <a href="#stats">성과</a><a href="#market">시장</a><a href="#history">기록</a><a href="#system">라즈베리파이</a>
+      <nav class="tabs" id="tabs" role="tablist" aria-label="화면">
+        <button type="button" role="tab" data-go="home">🏠 홈</button><button type="button" role="tab" data-go="research">🔬 연구</button><button type="button" role="tab" data-go="records">🧾 기록</button><button type="button" role="tab" data-go="pi">🍓 파이</button>
       </nav>
     </div>
   </div>
@@ -31,7 +32,7 @@
   <div class="alerts" id="alerts"></div>
 
   <!-- 개요 -->
-  <div class="hero" id="overview" style="margin-top:14px">
+  <div class="hero four" id="overview" style="margin-top:14px" data-tab="home">
     <div class="card total-card">
       <div class="total-main">
         <div class="label" id="totalLabel">총 자산</div>
@@ -66,28 +67,22 @@
         <div class="range-labels num"><span id="rangeLow"></span><span id="rangeHigh"></span></div>
       </div>
     </div>
-  </div>
-
-  <div class="kpis">
-    <div class="card"><div class="label">실현 손익</div><div class="value num" id="realized">-</div><div class="sub" id="realizedSub">-</div></div>
-    <div class="card"><div class="label">승률</div><div class="value num" id="winrate">-</div><div class="sub" id="winrateSub">-</div></div>
     <div class="card"><div class="label">🏦 금고 (쉬는 돈)</div><div class="value num" id="vault">-</div><div class="sub" id="vaultSub">입금하면 금고로 들어와요</div>
       <div class="slot-actions" id="vaultActions" hidden>
         <button type="button" id="paperIn">＋ 가상 입금</button><button type="button" id="paperOut" class="ghost">가상 출금</button>
       </div>
       <div id="vaultPanel"></div>
     </div>
-    <div class="card"><div class="label">최대 낙폭</div><div class="value num" id="mdd">-</div><div class="sub" id="mddSub">자산 고점 대비</div></div>
   </div>
 
   <!-- 계좌 한눈에 (한 계좌 한 줄) -->
-  <section class="card" id="brief">
+  <section class="card" id="brief" data-tab="home">
     <h2><span class="ico">📋</span>코인 계좌 한눈에 <small>누르면 아래 차트가 그 종목으로 바뀌어요 · 자세한 건 아래 계좌 카드</small></h2>
     <div class="brief" id="briefList"></div>
   </section>
 
   <!-- 차트 -->
-  <section class="card" id="chart">
+  <section class="card" id="chart" data-tab="home">
     <h2><span class="ico">📈</span>가격 차트 <small id="chartSub">일봉 · ▲매수 ▼매도</small>
       <span class="right seg ranges" id="daysSeg">
         <button type="button" data-span="5y">5년</button><button type="button" data-span="1y">1년</button><button type="button" data-span="6m">6개월</button><button type="button" data-span="3m" aria-pressed="true">3달</button><button type="button" data-span="1m">1개월</button><button type="button" data-span="1w">1주</button><button type="button" data-span="1d">1일</button><button type="button" data-span="1h">1시간</button>
@@ -100,13 +95,13 @@
   </section>
 
   <!-- 코인 계좌 -->
-  <section id="accounts" style="margin-top:14px">
+  <section id="accounts" style="margin-top:14px" data-tab="home">
     <h2 style="margin:0 0 10px"><span class="ico">📦</span>코인 계좌 <small class="muted" style="font-weight:400;font-size:12.5px">코인 하나 + 전략 · 자기 원화로만 사고, 팔면 원화가 계좌에 남아요</small></h2>
     <div class="slots" id="portfolio"></div>
   </section>
 
   <!-- 코인 계좌 만들기 -->
-  <section class="card" id="addBox" hidden>
+  <section class="card" id="addBox" hidden data-tab="home">
     <h2><span class="ico">➕</span>코인 계좌 만들기 <small>같은 코인도 다른 전략으로 여러 개 만들 수 있어요 · 실거래면 원래 있던 코인은 그 코인의 바이앤홀드 계좌로 모아요</small>
       <button type="button" class="ghost small right" id="addClose">닫기</button></h2>
     <div class="addgrid three">
@@ -124,7 +119,7 @@
   </section>
 
   <!-- 전략 순위 · 시뮬레이션 -->
-  <section class="card" id="sim">
+  <section class="card" id="sim" data-tab="research">
     <h2><span class="ico">🥇</span>전략 순위 · 시뮬레이션 <small>과거에 이 전략대로 사고팔았다면?</small></h2>
     <div class="simbar">
       <label><span>종목</span><select id="simMarket"></select></label>
@@ -150,7 +145,7 @@
     <p class="note">줄을 누르면 위 차트가 그 전략으로 바뀌어요 · ⚠️ "과거에 이렇게 했다면?"을 계산한 결과라 앞으로도 같다는 보장은 없어요 · 수수료 0.05% 반영 · 100만 원으로 시작했다고 치고 계산</p>
   </section>
 
-  <div class="row3" id="guides">
+  <div class="row3" id="guides" data-tab="research">
     <section class="card">
       <h2><span class="ico">🏁</span>전략 수익 곡선 비교 <small id="compareSub">상위 3개 + 사용 중 + 바이앤홀드</small></h2>
       <div class="chart-box" id="compareBox"><div class="empty">순위가 계산되면 보여요</div></div>
@@ -162,7 +157,42 @@
     </section>
   </div>
 
-  <div class="row2" id="stats">
+  <!-- 좋은 조합 찾기: /finder.js가 채운다 -->
+  <section class="card" id="finder" data-tab="research"></section>
+
+  <section class="card" id="market" data-tab="research">
+    <h2><span class="ico">🔥</span>오늘의 시장 <small>거래대금 상위 30개 · 누르면 코인 계좌 만들기</small></h2>
+    <div class="movers">
+      <div><h3>🚀 급등 TOP 5</h3><div id="gainers"></div></div>
+      <div><h3>🧊 급락 TOP 5</h3><div id="losers"></div></div>
+    </div>
+    <div class="note" id="moversNote"></div>
+  </section>
+
+  <div class="row3" id="history" data-tab="records">
+    <section class="card">
+      <h2><span class="ico">🧾</span>매매 기록 <small>최근 30건</small></h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th class="left">시간</th><th class="left">종목</th><th class="left">구분</th><th>가격</th><th>금액</th><th>손익</th></tr></thead>
+          <tbody id="trades"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="tradesEmpty">아직 매매 기록이 없어요</div>
+    </section>
+    <section class="card">
+      <h2><span class="ico">📰</span>이벤트</h2>
+      <ul class="events" id="events"></ul>
+    </section>
+  </div>
+
+  <div class="kpis three" data-tab="records">
+    <div class="card"><div class="label">실현 손익</div><div class="value num" id="realized">-</div><div class="sub" id="realizedSub">-</div></div>
+    <div class="card"><div class="label">승률</div><div class="value num" id="winrate">-</div><div class="sub" id="winrateSub">-</div></div>
+    <div class="card"><div class="label">최대 낙폭</div><div class="value num" id="mdd">-</div><div class="sub" id="mddSub">자산 고점 대비</div></div>
+  </div>
+
+  <div class="row2" id="stats" data-tab="records">
     <section class="card">
       <h2><span class="ico">🏆</span>성과 통계 <small id="statsSub"></small><span class="right streak" id="streak" hidden></span></h2>
       <div class="stat-grid">
@@ -182,49 +212,26 @@
     </section>
   </div>
 
-  <div class="row2">
-    <section class="card" id="market">
-      <h2><span class="ico">🔥</span>오늘의 시장 <small>거래대금 상위 30개 · 누르면 코인 계좌 만들기</small></h2>
-      <div class="movers">
-        <div><h3>🚀 급등 TOP 5</h3><div id="gainers"></div></div>
-        <div><h3>🧊 급락 TOP 5</h3><div id="losers"></div></div>
-      </div>
-      <div class="note" id="moversNote"></div>
-    </section>
-    <section class="card">
-      <h2><span class="ico">💰</span>자산 추이 <small id="chartTitle">최근 7일 · 5분 간격</small></h2>
-      <div class="chart-box" id="equityBox"><div class="empty">데이터를 모으는 중이에요</div></div>
-    </section>
-  </div>
+  <section class="card" id="equityCard" data-tab="records">
+    <h2><span class="ico">💰</span>자산 추이 <small id="chartTitle">최근 7일 · 5분 간격</small></h2>
+    <div class="chart-box" id="equityBox"><div class="empty">데이터를 모으는 중이에요</div></div>
+  </section>
 
-  <div class="row3" id="history">
-    <section class="card">
-      <h2><span class="ico">🧾</span>매매 기록 <small>최근 30건</small></h2>
-      <div class="scroll">
-        <table>
-          <thead><tr><th class="left">시간</th><th class="left">종목</th><th class="left">구분</th><th>가격</th><th>금액</th><th>손익</th></tr></thead>
-          <tbody id="trades"></tbody>
-        </table>
-      </div>
-      <div class="empty" id="tradesEmpty">아직 매매 기록이 없어요</div>
-    </section>
-    <section class="card">
-      <h2><span class="ico">📰</span>이벤트</h2>
-      <ul class="events" id="events"></ul>
-    </section>
-  </div>
+  <section class="card" id="system" data-tab="pi"></section><!-- 라즈베리파이 상태: /pi.js가 채운다 -->
 
-  <section class="card" id="system"></section><!-- 라즈베리파이 상태: /pi.js가 채운다 -->
-
-  <footer>🥧 My_Pie · 5초마다 자동 새로고침 · 투자 판단과 책임은 본인에게 있어요</footer>
+  <footer>🐜 AntLab 개미연구소 · 5초마다 자동 새로고침 · 투자 판단과 책임은 본인에게 있어요</footer>
 </div>
 <div class="toasts" id="toasts"></div>
 
 <script src="/rules.js"></script>
+<script src="/tabs.js"></script>
 <script src="/curve.js"></script>
+<script src="/slotnums.js"></script>
+<script src="/finder.js"></script>
 <script src="/simjob.js"></script>
 <script src="/pi.js"></script>
 <script src="/settings.js"></script>
+<script src="/theme.js"></script>
 <script>
 // ---------- 도우미 ----------
 const $ = (id) => document.getElementById(id);
@@ -376,8 +383,9 @@ function renderAll() {
   renderSlots(s);
   renderSelected(s);
   renderPills();
+  Finder.refresh();
 
-  document.title = `${won(a.equity)} · My_Pie`;
+  document.title = `${won(a.equity)} · AntLab`;
   $('chartTitle').textContent = `${live ? '실거래' : '모의투자'} · 최근 7일 · 5분 간격`;
   simTick();
   renderCompare();
@@ -412,16 +420,8 @@ function renderDonut(s) {
   parts.forEach((p) => lg.append(el('span', {}, el('i', { style: `background:${p.color}` }), `${p.label} ${(p.v / total * 100).toFixed(1)}%`)));
 }
 
-function realizedTile(x) {  // 판 매매로 확정된 손익 (수수료 뺀 뒤): 합계 + 번 돈·잃은 돈
-  const v = el('div', { class: 'v num', text: x.sells ? signedWon(x.realized) : '0원' }); tone(v, x.realized);
-  return el('div', { class: 'tile wide', title: '판 매매로 확정된 손익이에요. 수수료는 이미 뺐어요.' },
-    el('div', { class: 'label', text: x.sells ? `💰 확정 손익 · ${x.wins}승 ${x.sells - x.wins}패` : '💰 확정 손익' }), v,
-    el('div', { class: 'sub num', text: x.sells ? `(번 돈 ${signedWon(x.gains)} · 잃은 돈 ${signedWon(x.losses)})` : '(아직 판 매매가 없어요)' }));
-}
-function holdLine(text, n) {  // 카드의 수익률·손익 아래 '(바이앤홀드 …)' 한 줄
-  const d = el('div', { class: 'sub num hold-line', text: text || '(-)', title: '괄호 안 = 같은 돈을 같은 때 넣고 그냥 들고 있었다면 (바이앤홀드)' });
-  tone(d, n);
-  return d;
+function stateNote(t) {  // 봇의 상태 글에서 '다음 판단 01:00'처럼 위 ⏱ 줄과 겹치는 시각을 뺀다
+  return String(t || '').replace(/ · (다음 판단 \d\d:\d\d|매일 09시 판단)$/, '').replace(/ · \d\d:\d\d에 다시 판단$/, '');
 }
 function planLine(x) {
   const p = x.plan;
@@ -481,7 +481,6 @@ function renderSlots(s) {
   const focused = document.activeElement && box.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName);
   if (focused) return;  // 입력 중이면 다시 그리지 않는다 (글자가 날아가지 않게)
   box.innerHTML = '';
-  const byMarket = (S.stats && S.stats.by_market) || {};
   s.slots.forEach((x, i) => {
     const t = ticker(x.market), rate = t ? (x.price / t.prev_close - 1) * 100 : null;
     const card = el('div', { class: 'card slot-card' + (x.rank_key === S.sel ? ' sel' : ''), title: '눌러서 이 종목의 차트·순위 보기' });
@@ -489,6 +488,8 @@ function renderSlots(s) {
     const chip = x.closing ? '🧹 팔고 빼는 중' : x.holding ? '🟢 보유' : x.book.krw >= (S.data.min_order || 5000) ? '⏳ 대기' : '👀 지켜보기';
     const [fold, sum, expanded] = foldParts(x);
     card.classList.add(expanded ? 'open' : 'folded');
+    card.dataset.slot = x.id;
+    if (S.flashSlot && S.flashSlot.id === x.id && Date.now() < S.flashSlot.until) card.classList.add('flash');  // 찾아온 카드 (다시 그려도)
     const head = el('div', { class: 'slot-head' },
       el('div', { class: 'slot-name' }, x.name, el('small', { text: sym(x.market) })),
       el('div', { class: 'slot-chips' }, el('span', { class: 'chip', text: chip }), fold));
@@ -498,25 +499,21 @@ function renderSlots(s) {
     const price = el('div', { class: 'slot-price num' }, priceText(x.price) + '원 ');
     if (rate != null) { const b = el('span', { class: 'badge', text: pct(rate) }); tone(b, rate); b.classList.add(rate > 0 ? 'up' : rate < 0 ? 'down' : 'x'); price.append(b); }
     const [pl, pv] = planLine(x);
-    const strat = el('div', { class: 'slot-strat' }, el('b', {}, '🧠 ', ...ruleNodes(x.rule, stratLabel, ruleSignals(x))),
-                           x.stop_loss > 0 ? el('span', { class: 'tag stop', text: '🛑 ' + stopText(x.stop_loss) }) : '', ` · ${pl} ${pv}`);
-    if (!expanded) {  // 접힌 카드: 이름 · 주기 · 현재가 · 전략 줄과 계좌 금액(수익률). 누르면 펼치고 차트도 그 종목으로
-      card.append(head, when, price, strat, sum);
+    const stratLine = (withPlan) => el('div', { class: 'slot-strat' }, el('b', {}, '🧠 ', ...ruleNodes(x.rule, stratLabel, ruleSignals(x))),
+                           x.stop_loss > 0 ? el('span', { class: 'tag stop', text: '🛑 ' + stopText(x.stop_loss) }) : '', withPlan ? ` · ${pl} ${pv}` : '');
+    if (!expanded) {  // 접힌 카드: 이름 · 주기 · 현재가 · 전략 줄(+ 짧은 계획)과 계좌 금액(수익률). 누르면 펼치고 차트도 그 종목으로
+      card.append(head, when, price, stratLine(true), sum);
       card.onclick = () => { toggleCard(x.id, true); selectMarket(x.rank_key); };
       box.append(card);
       return;
     }
-    const state = el('div', { class: 'slot-state', text: (x.holding ? '🟢 ' : '⏳ ') + x.state_text });
-    const m = byMarket[x.market];
-    const ret = el('div', { class: 'v num', text: pct(x.return_pct) }); tone(ret, x.return_pct);
-    const right = x.holding
-      ? (() => { const v = el('div', { class: 'v num', text: `${signedWon(x.unrealized)}` }); tone(v, x.unrealized); return el('div', { class: 'tile' }, el('div', { class: 'label', text: `평가 손익 ${pct(x.unrealized_pct, 1)}` }), v); })()
-      : el('div', { class: 'tile' }, el('div', { class: 'label', text: '계좌 원화' }), el('div', { class: 'v num', text: won(x.book.krw) }));
-    const retTile = el('div', { class: 'tile' }, el('div', { class: 'label', text: m ? `계좌 수익률 · ${m.wins}승 ${m.round_trips - m.wins}패` : '계좌 수익률' }), ret);
-    // 같은 돈을 같은 때 넣고 그냥 들고 있었다면 (바이앤홀드)
-    retTile.append(holdLine(x.hold_return_pct == null ? null : `(${pct(x.hold_return_pct)})`, x.hold_return_pct));
-    right.append(holdLine(x.hold_pnl == null ? null : `(${signedWon(x.hold_pnl)})`, x.hold_pnl));
-    const foot = el('div', { class: 'slot-foot' }, retTile, right, realizedTile(x));
+    // 펼친 카드: 계획은 상태 한 줄로 (다음 판단 시각은 위 ⏱ 줄에 있으니 빼고, 매수 목표면 얼마 남았는지 붙인다)
+    const strat = stratLine(false);
+    const toGo = !x.holding && x.plan && x.plan.buy_stop != null && x.price ? (x.plan.buy_stop - x.price) / x.price * 100 : null;
+    const state = el('div', { class: 'slot-state', text: (x.holding ? '🟢 ' : '⏳ ') + stateNote(x.state_text)
+                                                         + (toGo != null ? (toGo > 0 ? ` (${toGo.toFixed(2)}% 남음)` : ' 🎯') : '') });
+    // 숫자 칸: 이 전략 vs 그냥 들고 있었다면 + 계좌 금액 줄들 (slotnums.js, 주식과 같다)
+    const foot = slotNumbers(x, { contrib: x.book.contrib, cash: x.book.krw, held: x.coin || '코인', costNote: '수수료는 이미 뺐어요.' });
     // 넣기·빼기·전략 바꾸기·지우기 (누르면 카드 아래에 칸이 열린다)
     const acts = el('div', { class: 'slot-actions' }), panel = el('div');
     const open = (kind) => { S.open = S.open.slot === x.id && S.open.kind === kind ? {} : { slot: x.id, kind }; renderSlots(S.data.status); };
@@ -884,7 +881,7 @@ function openAdd(preset = {}) {  // preset: {market, tf, rule, stop} (시뮬레�
   if (S.addStopBox) S.addStopBox.set(S.add.stop);
   renderAdd();
   requestRanking(S.add.market, S.add.tf);
-  $('addBox').scrollIntoView({ block: 'start' });
+  Tabs.reveal($('addBox'));
 }
 function addSig() { const a = S.add, rk = a && ranking(rkey(a.market, a.tf)); return a ? `${a.market}|${a.tf}|${rk ? rk.computed_at || rk.error || '' : ''}` : ''; }
 function renderAdd() {
@@ -1028,34 +1025,20 @@ function renderSim() {
   // hold: 손절 없이 그냥 들고 있었다면 (손절선을 켜면 순위표의 바이앤홀드 줄과 다르다)
   const res = r.results.find(x => x.name === d.name), hold = r.hold || r.results.find(x => x.name === 'buy_and_hold') || res;
   const period = simPeriods(tf).find(p => p.days === r.days);
-  const fin = SIM_BASE * (1 + res.total_return), hfin = SIM_BASE * (1 + hold.total_return);
-  const diff = (res.total_return - hold.total_return) * 100, name = marketName(r.market);
+  const name = marketName(r.market);
   const line = $('simLine'); line.innerHTML = '';
   // 일봉과 한 달이 넘는 분봉 기간은 해가 넘어가니 연도까지 (분봉 키는 한국 시각으로)
   const ymd = (k) => new Date(new Date(k + ':00Z').getTime() + 9 * 3600e3).toISOString().slice(0, 10);
   const span = tf === '1d' ? `${r.from} ~ ${r.to}` : r.days > 30 ? `${ymd(r.from)} ~ ${ymd(r.to)}` : `${barLabel(r.from, tf)} ~ ${barLabel(r.to, tf)}`;
-  line.append(`최근 ${period ? period.label : r.days + '일'}(${span}) 동안 ${name}${josa(name, '을', '를')} ${tfName(tf)} `,
-    el('b', { text: `'${res.label}'` }), `${josa(res.label, '으로', '로')} 사고팔았다면` + (r.stop_loss ? ` (${stopText(r.stop_loss)})` : '') + ' 100만 원이 ',
-    el('b', { class: res.total_return > 0 ? 'up' : res.total_return < 0 ? 'down' : '', text: `${won(fin)}(${pct(res.total_return * 100, 1)})` }),
-    '이 됐어요. ' + (d.name === 'buy_and_hold' && !r.stop_loss ? '' :
-      `그냥 사서 들고 있었다면 ${won(hfin)}(${pct(hold.total_return * 100, 1)})이었으니 ` +
-      (Math.abs(diff) < 0.05 ? '거의 같아요. ' : `${Math.abs(diff).toFixed(1)}%p ${diff > 0 ? '더 벌었어요' : '덜 벌었어요'}. `)) +
-    (d.holding ? '마지막엔 코인을 들고 있었어요.' : '마지막엔 현금으로 기다리고 있었어요.') +
-    (r.stale ? ' (최근 봉을 받아 오는 중이라 조금 지난 데이터예요)' : '') +
-    (r.long && r.computed_at ? ` (${r.computed_at.slice(5, 16)}에 따로 계산한 결과예요)` : ''));
-  const tiles = $('simTiles'); tiles.innerHTML = '';
-  const tile = (label, v, sub, n) => {
-    const t = el('div', { class: 'tile' }, el('div', { class: 'label', text: label }), el('div', { class: 'v num', text: v }));
-    if (sub) t.append(el('div', { class: 'sub', text: sub }));
-    if (n != null) tone(t.querySelector('.v'), n);
-    tiles.append(t);
-  };
-  tile('100만 원 →', won(fin), pct(res.total_return * 100, 1), res.total_return);
-  tile('그냥 들고 있었다면', won(hfin), pct(hold.total_return * 100, 1), hold.total_return);
-  tile('가장 크게 빠졌을 때', pct(res.mdd * 100, 1), '고점 대비 최대 낙폭', res.mdd < 0 ? -1 : 0);
-  tile('사고판 횟수', `${res.trades}번`, res.win_rate == null ? '아직 판 적 없음' : `이긴 비율 ${Math.round(res.win_rate * 100)}%`);
-  const count = r.results.filter(x => !x.combo).length;
-  tile('이 기간 순위', `${res.rank}위`, res.combo ? `전략 ${count}개 사이에 넣으면` : `전략 ${count}개 중`);
+  // 머리줄: 기간 · 날짜 · 전략 (종목·주기는 위 칸에 있다). 숫자는 아래 표로 (slotnums.js, 주식과 같다)
+  line.append(el('span', { class: 'muted', text: `최근 ${period ? period.label : r.days + '일'} · ${span} · ${name} ${tfName(tf)} · ` }),
+    el('b', { text: res.label }), r.stop_loss ? el('span', { class: 'muted', text: ` · ${stopText(r.stop_loss)}` }) : '');
+  const note = (text, cls) => line.append(el('span', { class: cls || 'sim-note', text }));
+  if (r.stale) note('최근 봉을 받아 오는 중이라 조금 지난 데이터예요');
+  if (r.long && r.computed_at) note(`${r.computed_at.slice(5, 16)}에 따로 계산한 결과예요`);
+  if (r.short) note(`※ 상장한 지 얼마 안 돼서 ${period ? period.label : r.days + '일'} 대신 있는 만큼만 계산했어요 (위 날짜부터).`, 'finder-short');
+  $('simTiles').replaceChildren(...NumBox.sim(res, hold, { base: SIM_BASE, count: r.results.filter(x => !x.combo).length, combo: res.combo,
+                                                          holding: d.holding, thing: '코인' }));
   drawSim();
 }
 
@@ -1345,6 +1328,32 @@ async function refreshCandles() {
   try { const c = await getJSON(`/api/candles?market=${encodeURIComponent(m)}&span=${S.span}`); if (key === S.sel) { S.candles = c; renderCandles(); } } catch (e) {}
 }
 async function refreshStats() { try { S.stats = await getJSON('/api/stats'); renderStats(); if (S.data && S.data.status) renderSlots(S.data.status); } catch (e) {} }
+
+// 좋은 조합 찾기 (finder.js): 결과의 📊를 누르면 시뮬레이션 칸이 그 종목·주기·조합으로 (가장 긴 기간까지)
+function useCombo(res, row) {
+  const tf = (S.data.timeframes || []).find(t => t.id === res.tf), periods = tf ? tf.periods.filter(p => p.days <= res.years * 365) : [];
+  S.simSel = { market: res.market, tf: res.tf, rule: normalizeRule(row.rule), stop: 0,
+               days: periods.length ? periods[periods.length - 1].days : SIM_DEFAULT_DAYS[res.tf] };
+  refreshSim();
+  Tabs.reveal($('sim'));
+}
+// 좋은 조합 찾기의 ➕: 같은 종목·주기·조합 계좌가 이미 있으면 그 카드를 펼쳐 보여주고, 없으면 계좌 만들기 칸을 그 조합으로 채운다
+function createFromCombo(res, row) {
+  const x = (S.data.status ? S.data.status.slots : []).find(x => x.market === res.market && x.tf === res.tf && sameCombo(slotRule(x), row.rule));
+  if (x) {
+    toast(`이미 이 조합 계좌가 있어요 · ${x.name}`, 'info');
+    selectMarket(x.rank_key);
+    toggleCard(x.id, true);
+    S.flashSlot = { id: x.id, until: Date.now() + 2400 };
+    renderSlots(S.data.status);
+    const card = document.querySelector(`.slot-card[data-slot="${x.id}"]`);
+    Tabs.reveal(card, 'center');
+    return;
+  }
+  openAdd({ market: res.market, tf: res.tf, rule: row.rule, stop: 0 });
+}
+Finder.init({ onCreate: createFromCombo, kind: 'coin', onUse: useCombo, current: () => (S.sel ? splitKey(S.sel)[0] : 'KRW-BTC'),
+  markets: () => ((S.data && S.data.markets) || []).map(m => ({ value: m.market, text: `${m.name || m.market} (${sym(m.market)})` })) });
 
 refreshStatus().then(() => { refreshCandles(); refreshStats(); });
 setInterval(refreshStatus, 5000);

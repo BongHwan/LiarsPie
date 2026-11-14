@@ -50,6 +50,20 @@ SYMBOL_PATTERN = re.compile(r"^[0-9A-Z]{6}$")
 TRADING_DAYS_PER_YEAR = 250
 SESSION_TEXT = {"closed": "휴장일", "pre": "장 시작 전", "open": "장 열림", "closing": "장 마감 동시호가",
                 "after": "장 마감"}
+# 종목마다 사고파는 시간 (바로바로 체결되는 시간만. 한꺼번에 체결하는 단일가 시간에는 새 주문을 내지 않는다)
+#   정규장 09:00~15:20: 모든 종목
+#   넥스트레이드 종목: 프리마켓 08:00~08:50, 애프터마켓 15:40~20:00
+#   KRX 애프터마켓(2026-09-14부터) 16:00~20:00: 보통 주식만 (ETF·ETN은 안 된다)
+# 프리마켓·애프터마켓 시간은 토스증권 장 달력이 하루 한 번 알려 준다 (못 받으면 아래 기본값)
+EXT_HOURS = {"pre": ("08:00", "08:50"), "after": ("15:40", "20:00")}
+WINDOW_NAMES = {"pre": "프리마켓", "regular": "정규장", "after": "애프터마켓"}
+KRX_AFTER_START = "16:00"
+KRX_AFTER_TYPES = {"STOCK", "FOREIGN_STOCK", "DEPOSITARY_RECEIPT", "REIT"}
+EXT_BLOCK_SEC = 600         # 장 밖 주문이 '지금은 주문 안 되는 시간'이라고 거절되면 이만큼 쉬었다가 다시 해 본다
+# 체결: 그 순간의 호가로 지정가를 내고, 덜 되면 다음 루프에 그때 호가로 다시 낸다
+OPEN_RETRY_SEC = 300        # 하루 첫 거래 때 매수가 안 되면 이 시간 동안 다시 해 본다 (파는 건 다 팔릴 때까지)
+BUY_BAND = 0.01             # 사려는 값이 계획 가격보다 이만큼 넘게 비싸면 쫓아 사지 않는다 (폭등)
+clock = time.time
 
 
 def sync_daily(db: Database, client, symbol: str, wanted: int, today: str) -> None:
@@ -76,30 +90,35 @@ def sync_daily(db: Database, client, symbol: str, wanted: int, today: str) -> No
         oldest = new_oldest
 
 
-REGULAR_TF = "1dk"          # 정규장(09:00~15:30) 일봉. 판단·순위·시뮬레이션은 모두 이걸로 한다 (봇은 정규장에서만 사고판다)
-REGULAR_BUDGET = {True: 5, False: 40}  # 한 루프에 1분봉으로 다시 만드는 날 수 (장중이면 조금씩: 루프가 오래 멈추지 않게)
+DAY_TF = "1d"  # 판단·순위·시뮬레이션에 쓰는 일봉: KRX·넥스트레이드 통합 (봇이 사고파는 시간 전체와 같다)
 
 
-def sync_regular(db: Database, client, symbol: str, nxt: bool, today: str, budget: int) -> bool:
-    """정규장 일봉을 일봉('1d')에 맞춰 채운다. NXT 종목의 NXT 개장일 뒤 날짜만 1분봉으로 다시 만들고
-    (토스증권 일봉이 08:00~20:00을 합친 값이라), 그 전 날짜와 NXT가 아닌 종목은 그대로 옮긴다.
-    1분봉으로 만드는 날은 한 번에 budget개까지. 다 맞췄으면 True."""
-    have = {r["day"] for r in db.candle_history(symbol, 100_000, REGULAR_TF)}
-    todo = [r for r in db.candle_history(symbol, 100_000, "1d") if r["day"] not in have and r["day"] < today]
-    copies = [r for r in todo if not nxt or r["day"] < toss.NXT_START]
-    if copies:
-        db.upsert_candles(symbol, copies, REGULAR_TF)
-    rebuild = sorted((r for r in todo if nxt and r["day"] >= toss.NXT_START), key=lambda r: r["day"], reverse=True)
-    for r in rebuild[:budget]:
-        bar = client.regular_day(symbol, r["day"])
-        db.upsert_candles(symbol, [bar or r], REGULAR_TF)  # 정규장 거래가 없던 날(거래정지 등)은 일봉 그대로
-    return len(rebuild) <= budget
+def daily_ready(db: Database, symbol: str) -> bool:
+    return db.candle_range(symbol, DAY_TF)[0] > 0
 
 
-def regular_ready(db: Database, symbol: str) -> bool:
-    """정규장 일봉이 일봉과 같은 날들까지 다 만들어졌는지 (덜 됐으면 사이가 비어서 지표가 틀린다)."""
-    count, _ = db.candle_range(symbol, "1d")
-    return count > 0 and db.candle_range(symbol, REGULAR_TF)[0] >= count
+def stock_type(db: Database, symbol: str) -> str:
+    """종목 종류 (STOCK·ETF·ETN 등): 봇이 확인해 둔 것, 없으면 종목 목록, 그것도 없으면 보통 주식."""
+    known = ((db.get_state("nxt_symbols") or {}).get(symbol) or {}).get("type")
+    listed = next((s.get("type") for s in (db.get_state("stocks") or {}).get("list", []) if s["symbol"] == symbol), None)
+    return known or listed or "STOCK"
+
+
+def slippage_summary(db: Database, mode: str) -> dict:
+    """계획 가격 대비 실제 체결이 얼마나 불리했나 (살 때는 비싸게, 팔 때는 싸게 = +). 매수·매도마다 평균 호가 칸 수와 %."""
+    out, types = {}, {}
+    trades = [t for t in db.trades(mode) if t.get("ref")]
+    etf = lambda market: types.setdefault(market, stock_type(db, market) in krx.ETF_TYPES)
+    for side in ("buy", "sell"):
+        rows = [t for t in trades if t["side"] == side]
+        worse = [(t["price"] - t["ref"]) if side == "buy" else (t["ref"] - t["price"]) for t in rows]
+        if rows:
+            ticks = [w / krx.tick_size(t["ref"], etf(t["market"])) for w, t in zip(worse, rows)]
+            out[side] = {"n": len(rows), "ticks": sum(ticks) / len(rows),
+                         "pct": sum(w / t["ref"] * 100 for w, t in zip(worse, rows)) / len(rows)}
+        else:
+            out[side] = {"n": 0}
+    return out
 
 
 class StockSlot:
@@ -147,7 +166,9 @@ class StockBot:
         self.holidays: set[str] = set(db.get_state("extra_holidays") or [])
         self.open_day: str | None = None
         self.synced_today: dict[str, tuple[str, int]] = {}  # 종목 → (날짜, 받아 둔 일봉 수)
-        self.regular_today: dict[str, str] = {}  # 종목 → 정규장 일봉을 다 맞춘 날
+        self.ext_hours: tuple[str, dict] = ("", {})  # (날짜, 프리마켓·애프터마켓 시간)
+        self.active: dict[str, str] = {}             # 지금 사고팔 수 있는 계좌 → 'pre' | 'regular' | 'after'
+        self.ext_blocked: dict[str, float] = {}      # 장 밖 주문이 거절된 종목 → 다시 해 볼 때
         self.report_day: str | None = db.get_state("report_day")
         self.stocks_day: str | None = (db.get_state("stocks") or {}).get("day")
         self.last_quotes = self.last_sync = self.last_snapshot = self.last_client_try = 0.0
@@ -258,24 +279,16 @@ class StockBot:
             self._write_status(now, sess)
             return sess
         self._recover()
-        self._refresh_quotes(sess, now)
-        self._sync(sess)  # 실거래면 금고를 실제 현금에 먼저 맞춘 뒤에 이체 요청을 처리한다
+        self.active = self._active_slots(sess, now, today)  # 지금 사고팔 수 있는 계좌 (정규장 · 프리마켓 · 애프터마켓)
+        self._refresh_quotes(sess, now, busy=bool(self.active))
+        self._sync(sess, busy=bool(self.active))  # 실거래면 금고를 실제 현금에 먼저 맞춘 뒤에 이체 요청을 처리한다
         self._handle_requests(today)
-        if sess == "open" and self._market_open_today(now, today):
-            for s in [s for s in self.slots if s.closing and s.symbol in self.prices]:
-                self._close_out(s)
-            for s in self.slots:
-                if s.plan_day != today and not s.closing:
-                    self._plan(s, today)
-            ready = [s for s in self.slots if s.plan_day == today and s.symbol in self.prices and not s.closing]
-            self._open_actions(ready, today)
-            for s in ready:
-                self._intraday(s, today)
+        if self.active and self._market_open_today(now, today):
+            self._trade(today)
         self._refresh_stocks(today)
-        if sess not in ("open", "closing"):
-            for s in self.slots:
-                if s.plan is None and s.last is None:
-                    self._look_back(s, sess, today)
+        for s in self.slots:  # 오늘 아직 거래가 없었던(또는 끝난) 계좌: 카드에 보여줄 마지막 판단
+            if s.id not in self.active and sess not in ("open", "closing") and s.plan is None and s.last is None:
+                self._look_back(s, sess, today)
         self._update_rankings(today)
         if sess == "after" and self.open_day == today:
             self._close_report(today)
@@ -285,22 +298,18 @@ class StockBot:
             self.last_snapshot = time.monotonic()
         return sess
 
-    def _refresh_quotes(self, sess: str, now: datetime | None = None) -> None:
+    def _refresh_quotes(self, sess: str, now: datetime | None = None, busy: bool = False) -> None:
+        """시세 (KRX·넥스트레이드 통합). 사고팔 수 있는 계좌가 있으면 루프마다, 아니면 가끔."""
         symbols = sorted({s.symbol for s in self.slots})
         if not symbols:
             return
-        busy = sess in ("open", "closing")
+        busy = busy or sess in ("open", "closing")
         if not busy and self.quotes and time.monotonic() - self.last_quotes < IDLE_REFRESH_SEC \
                 and all(sym in self.quotes for sym in symbols):
             return
         self.quotes.update(self._call(self.client.quotes, symbols))
         self.prices.update({sym: q["price"] for sym, q in self.quotes.items() if q.get("price")})
         self.last_quotes = time.monotonic()
-        previous = krx.previous_trading_day((now or now_kst()).date(), self.holidays).isoformat()
-        for sym in symbols:  # 등락률은 전날 정규장 종가 기준 (NXT 애프터마켓 20:00 종가 말고)
-            last = self.db.candle_history(sym, 1, REGULAR_TF)
-            if sym in self.quotes and last and last[0]["day"] == previous:
-                self.quotes[sym]["prev_close"] = last[0]["close"]
 
     def _call(self, fn, *args, **kwargs):
         """토스증권 호출. 허용 IP 오류면 표시해 두고, 키 만료면 알린 뒤 그대로 올려 보낸다."""
@@ -342,23 +351,22 @@ class StockBot:
         return False
 
     def _plan(self, slot: StockSlot, today: str) -> None:
-        """오늘 계획: 어제까지의 정규장 일봉 + 오늘 정규장 시가. 시가나 정규장 일봉이 아직이면 다음 루프에서 다시."""
+        """오늘 계획: 어제까지의 일봉 + 오늘 시가 (KRX·NXT 통합: NXT 종목이면 08:00 첫 거래). 시가가 아직이면 다음 루프에서 다시."""
         today_open = (self.quotes.get(slot.symbol) or {}).get("open")
         if not today_open:
             return
-        if not self._ensure_history(slot.symbol, today, slot.strategy.window + 5):
-            return  # 정규장 일봉을 만드는 중 (다음 루프에서 이어서)
-        history = self.db.candle_history(slot.symbol, slot.strategy.window, REGULAR_TF)
+        self._ensure_history(slot.symbol, today, slot.strategy.window + 5)
+        history = self.db.candle_history(slot.symbol, slot.strategy.window, DAY_TF)
         slot.plan = slot.strategy.plan(history, today_open)
         slot.plan_day = today
         self.event("info", f"[{today}] {slot.name} · {slot.strategy.label} · {slot.plan.note}")
 
     def _look_back(self, slot: StockSlot, sess: str, today: str) -> None:
-        """장 밖에서 켜져서 계획이 없을 때: 모아 둔 정규장 일봉으로 마지막 장 시작의 판단을 다시 세운다.
-        계좌 카드에서 전략마다 사자·팔자 색을 보여주는 데만 쓰고, 매매는 장 시작에 세우는 계획으로 한다."""
-        if not regular_ready(self.db, slot.symbol):
+        """거래 시간 밖에서 켜져서 계획이 없을 때: 모아 둔 일봉으로 마지막 거래일 시작의 판단을 다시 세운다.
+        계좌 카드에서 전략마다 사자·팔자 색을 보여주는 데만 쓰고, 매매는 거래가 시작될 때 세우는 계획으로 한다."""
+        if not daily_ready(self.db, slot.symbol):
             return
-        history = self.db.candle_history(slot.symbol, slot.strategy.window + 1, REGULAR_TF)
+        history = self.db.candle_history(slot.symbol, slot.strategy.window + 1, DAY_TF)
         today_open = (self.quotes.get(slot.symbol) or {}).get("open")
         if sess == "after" and today_open and history and history[-1]["day"] < today:
             # 오늘 장이 끝났는데 오늘 일봉은 아직 없다: 오늘 아침 판단 (어제까지 일봉 + 오늘 시가, _plan과 같다)
@@ -367,52 +375,168 @@ class StockBot:
             slot.last = (history[-1]["day"], slot.strategy.plan(history[:-1], history[-1]["open"]))
 
     def _ensure_history(self, symbol: str, today: str, wanted: int) -> bool:
-        """일봉을 모으고 정규장 일봉을 맞춘다. 정규장 일봉까지 다 됐으면 True."""
+        """일봉(KRX·NXT 통합)을 하루 한 번 모은다."""
         if self.synced_today.get(symbol, ("", 0)) < (today, wanted):
             self._call(sync_daily, self.db, self.client, symbol, wanted, today)
             self.synced_today[symbol] = (today, wanted)
-            self.regular_today.pop(symbol, None)
-        if self.regular_today.get(symbol) == today:
-            return True
-        busy = krx.session(now_kst(), self.holidays) in ("open", "closing")
-        done = self._call(sync_regular, self.db, self.client, symbol, self._nxt(symbol, today), today,
-                          REGULAR_BUDGET[busy])
-        if done:
-            self.regular_today[symbol] = today
-        return done
+        return True
 
-    def _nxt(self, symbol: str, today: str) -> bool:
-        """넥스트레이드에서도 거래되는 종목인지 (한 달에 한 번 확인해서 기억해 둔다)."""
+    # ---- 종목마다 사고파는 시간 ----
+
+    def _market_info(self, symbol: str, today: str | None = None) -> dict:
+        """종목 정보 {"nxt": 넥스트레이드에서도 거래되는지, "nxt_halt": 넥스트레이드 거래정지, "type": STOCK·ETF 등}.
+        하루 한 번 확인한다 (KRX만 되던 종목이 넥스트레이드에 새로 들어오면 그날부터 그 시간까지 사고판다).
+        today가 없으면 (또는 토스 키가 없으면) 기억해 둔 것만."""
         known = self.db.get_state("nxt_symbols") or {}
         entry = known.get(symbol)
-        if not entry or entry["checked"] < (date.fromisoformat(today) - timedelta(days=30)).isoformat():
-            entry = {"nxt": self._call(self.client.nxt_supported, [symbol]).get(symbol, False), "checked": today}
+        stale = not entry or "type" not in entry or (today and entry["checked"] < today)
+        if stale and today and self.client is not None:
+            if hasattr(self.client, "market_info"):
+                info = self._call(self.client.market_info, [symbol]).get(symbol) or {}
+            else:
+                info = {"nxt": self._call(self.client.nxt_supported, [symbol]).get(symbol, False)}
+            entry = {"nxt": bool(info.get("nxt")), "nxt_halt": bool(info.get("nxt_halt")), "type": info.get("type") or "STOCK",
+                     "checked": today}
             known[symbol] = entry
             self.db.set_state("nxt_symbols", known)
-        return entry["nxt"]
+        return entry or {"nxt": False, "nxt_halt": False, "type": "STOCK", "checked": ""}
+
+    def _nxt(self, symbol: str, today: str) -> bool:
+        return self._market_info(symbol, today)["nxt"]
+
+    def _ext_hours(self, today: str) -> dict:
+        """오늘 프리마켓·애프터마켓에서 바로바로 사고파는 시간 {"pre": (시작, 끝) | None, "after": ...}. 장 달력으로 하루 한 번."""
+        if self.ext_hours[0] != today:
+            fetch = getattr(self.client, "extended_hours", None)
+            if self.client is None:
+                return dict(EXT_HOURS)  # 아직 토스 키 전: 기본값만 (기억하지 않는다)
+            hours = dict(EXT_HOURS)
+            if fetch:
+                try:
+                    hours = self._call(fetch, today)
+                except toss.TossError as e:
+                    log.warning("장 달력을 받지 못해서 기본 시간으로 해요: %s", e)
+            self.ext_hours = (today, hours)
+        return self.ext_hours[1]
+
+    def _spans(self, info: dict, today: str, usual: bool = False) -> list[tuple[str, str, str]]:
+        """이 종목을 바로바로 사고팔 수 있는 시간들 [(이름, 시작, 끝)]. usual이면 오늘 장 달력 말고 평소 시간
+        (휴장일에도 카드에 평소 시간을 보여주고, '다음 거래 시작'을 말할 때)."""
+        ext, nxt = (EXT_HOURS if usual else self._ext_hours(today)), info["nxt"] and not info.get("nxt_halt")
+        out = [("pre", *ext["pre"])] if nxt and ext.get("pre") else []
+        out.append(("regular", krx.OPEN.strftime("%H:%M"), krx.LAST_ORDER.strftime("%H:%M")))
+        after = ext.get("after")
+        if after and nxt:
+            out.append(("after", *after))
+        elif after and info.get("type") in KRX_AFTER_TYPES and max(after[0], KRX_AFTER_START) < after[1]:
+            out.append(("after", max(after[0], KRX_AFTER_START), after[1]))
+        return out
+
+    def _window(self, slot: StockSlot, sess: str, now: datetime, today: str) -> str | None:
+        """이 계좌를 지금 사고팔 수 있으면 'pre' | 'regular' | 'after'."""
+        if sess not in ("pre", "open", "after"):
+            return None
+        if sess == "open":
+            return "regular"
+        t = now.strftime("%H:%M")
+        return next((name for name, a, b in self._spans(self._market_info(slot.symbol, today), today) if a <= t < b), None)
+
+    def _active_slots(self, sess: str, now: datetime, today: str) -> dict[str, str]:
+        out = {}
+        for s in self.slots:
+            self._market_info(s.symbol, today)  # 종목 정보는 하루에 한 번은 확인해 둔다 (카드의 KRX·NXT 표시에도 쓴다)
+            if s.symbol in self.ext_blocked and self.ext_blocked[s.symbol] > time.monotonic() and sess != "open":
+                continue  # 장 밖 주문이 거절된 종목: 잠깐 쉰다
+            window = self._window(s, sess, now, today)
+            if window:
+                out[s.id] = window
+        return out
+
+    def _day_start(self, slot: StockSlot, today: str) -> str:
+        """이 종목의 하루 첫 거래 시각 (넥스트레이드 종목이면 08:00 프리마켓)."""
+        return self._spans(self._market_info(slot.symbol), today, usual=True)[0][1]
+
+    def _day_over(self, slot: StockSlot, now: datetime, today: str) -> bool:
+        """오늘 이 종목의 마지막 거래 시간까지 끝났는지."""
+        spans = self._spans(self._market_info(slot.symbol), today)
+        last = max(krx.CLOSE.strftime("%H:%M"), spans[-1][2])
+        return now.strftime("%H:%M") >= last
+
+    def venue(self, symbol: str, today: str) -> dict:
+        """계좌 카드에 보여줄 거래소·거래 시간: KRX·NXT / KRX."""
+        info = self._market_info(symbol)
+        spans = self._spans(info, today, usual=True)
+        nxt = info["nxt"] and not info.get("nxt_halt")
+        names = {"pre": "프리마켓(NXT)", "regular": "정규장", "after": "애프터마켓" + ("(NXT·KRX)" if nxt else "(KRX)")}
+        detail = " · ".join(f"{names[n]} {a}~{b}" for n, a, b in spans)
+        if not nxt and info.get("type") not in KRX_AFTER_TYPES:
+            detail += " · ETF·ETN은 장 밖 거래가 없어요"
+        return {"label": "KRX·NXT" if nxt else "KRX", "nxt": nxt, "type": info.get("type"),
+                "hours": f"{spans[0][1]}~{max(krx.CLOSE.strftime('%H:%M'), spans[-1][2])}", "detail": detail}
+
+    def _trade(self, today: str) -> None:
+        """지금 사고팔 수 있는 계좌: 팔고 빼기 → 오늘 계획 → 하루 첫 거래 때 매매 → 돌파 매수·이탈 매도.
+        정규장이든 프리마켓·애프터마켓이든 같은 규칙이다 (판단·시뮬레이션도 그 시간 전체의 일봉으로 한다)."""
+        live = [s for s in self.slots if s.id in self.active and s.symbol in self.prices]
+        for s in live:
+            if s.closing:
+                self._guarded(s, lambda s=s: self._close_out(s))
+            elif s.plan_day != today:
+                self._plan(s, today)
+        for s in [s for s in live if s.plan_day == today and not s.closing]:
+            self._guarded(s, lambda s=s: (self._open_actions([s], today), self._intraday(s, today)))
+
+    def _guarded(self, slot: StockSlot, fn) -> None:
+        """장 밖에서 '지금은 주문 안 되는 시간'이라고 거절되면 (관리종목 등) 그 종목은 10분 쉬었다가 다시 해 본다."""
+        try:
+            fn()
+        except toss.OrderRejected as e:
+            window = self.active.get(slot.id)
+            if e.code != "order-hours-closed" or window == "regular":
+                raise
+            self.ext_blocked[slot.symbol] = time.monotonic() + EXT_BLOCK_SEC
+            key = (slot.symbol, now_kst().date().isoformat(), window)
+            if key not in self.warned:
+                self.warned.add(key)
+                self.event("info", f"{self._tag(slot)}지금은 {WINDOW_NAMES[window]}에서 이 종목 주문이 안 된다고 해서 "
+                                   f"{EXT_BLOCK_SEC // 60}분마다 다시 해 볼게요")
 
     def _rank_bars(self) -> int:
         """순위 계산에 쓰는 일봉 수: 백테스트 기간(거래일) + 지표 계산용 앞부분."""
         return self.backtest_days * TRADING_DAYS_PER_YEAR // 365 + backtest.history_needed(STOCK_STRATEGIES)
 
     def _open_actions(self, slots: list[StockSlot], today: str) -> None:
-        """장 시작 매매. 매도 신호가 난 계좌를 먼저 팔고, 그다음 매수 신호가 난 계좌를 산다."""
-        todo = [s for s in slots if self._sstate(s).get("open_done_day") != today]
-        sold = set()
-        for s in todo:
+        """하루 첫 거래 때 매매 (NXT 종목은 08:00 프리마켓, 나머지는 09:00). 매도 신호가 난 계좌는 팔고, 매수 신호가 난 계좌는 산다.
+        계획 가격은 오늘 시가. 덜 체결되면 다음 루프에 그때 호가로 다시 낸다: 파는 건 다 팔릴 때까지,
+        사는 건 OPEN_RETRY_SEC 동안 (호가가 시가보다 BUY_BAND 넘게 비싸면 쫓아 사지 않고 기다리다 접는다)."""
+        for s in slots:
+            st = self._sstate(s)
+            if st.get("open_done_day") == today:
+                continue
+            ref = (self.quotes.get(s.symbol) or {}).get("open") or self.prices[s.symbol]
             if self._holding(s) and s.plan.sell_at_open:
                 reason = "산 다음 장 시작에 매도" if s.strategy.exit_next_open else f"매도 신호 · {s.plan.note}"
-                self._sell(s, reason)
-                self._set_sstate(s.id, open_done_day=today)
-                sold.add(s.id)
-        for s in todo:
-            cut = self._sstate(s).get("cut")
+                self._sell(s, reason, ref)
+                if not self._holding(s):
+                    # 판 계좌는 같은 시작에 다시 사지 않는다 (살 때·팔 때 조합에서 사자·팔자가 같이 켜진 경우. 시뮬레이션과 같은 규칙)
+                    self._set_sstate(s.id, open_done_day=today)
+                continue  # 덜 팔렸으면 다음 루프에 남은 걸 그때 호가로 다시
+            cut = st.get("cut")
             if cut and not s.plan.buy_at_open:
                 cut = False  # 손절 뒤 매수 신호가 한 번 꺼졌다 → 다음 신호부터 다시 산다
                 self._set_sstate(s.id, cut=False)
-            # 방금 판 계좌는 같은 장 시작에 다시 사지 않는다 (살 때·팔 때 조합에서 사자·팔자가 같이 켜진 경우. 시뮬레이션과 같은 규칙)
-            if s.id not in sold and not cut and not self._holding(s) and s.plan.buy_at_open:
-                self._buy(s, today, f"매수 신호 · {s.plan.note}")
+            if not cut and not self._holding(s) and s.plan.buy_at_open:
+                started = st.get("open_try_at") if st.get("open_try_day") == today else None
+                if started is None:
+                    started = clock()
+                    self._set_sstate(s.id, open_try_day=today, open_try_at=started)
+                result = self._buy(s, today, f"매수 신호 · {s.plan.note}", ref)
+                if result in ("none", "far"):
+                    if clock() - started < OPEN_RETRY_SEC:
+                        continue  # 다음 루프에 그때 호가로 다시
+                    why = f"호가가 시가보다 {BUY_BAND:.0%} 넘게 비싸서" if result == "far" else "체결이 안 돼서"
+                    self.event("info", f"{self._tag(s)}장 시작 매수를 {OPEN_RETRY_SEC // 60}분 동안 {why} 오늘은 건너뛰어요",
+                               notify=True)
             self._set_sstate(s.id, open_done_day=today)  # 재시작해도 장 시작 매매를 두 번 하지 않게
 
     def _loss_line(self, slot: StockSlot) -> float | None:
@@ -423,16 +547,19 @@ class StockBot:
         plan, st, price = slot.plan, self._sstate(slot), self.prices[slot.symbol]
         if self._holding(slot):
             loss = self._loss_line(slot)  # 손절선은 산 직후에도 지킨다
-            if loss is not None and price <= loss:
-                self._sell(slot, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈")
+            today_open = (self.quotes.get(slot.symbol) or {}).get("open") or price
+            if loss is not None and price <= loss:  # 계획 가격 = 시뮬레이션과 같이 min(시가, 이탈 가격)
+                self._sell(slot, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈", min(today_open, loss))
                 self._set_sstate(slot.id, last_stop_day=today, cut=True)
                 return
             if plan.sell_stop is not None and st.get("last_buy_day") != today and price <= plan.sell_stop:
-                self._sell(slot, f"{plan.sell_stop:,.0f}원 이탈")
+                self._sell(slot, f"{plan.sell_stop:,.0f}원 이탈", min(today_open, plan.sell_stop))
                 self._set_sstate(slot.id, last_stop_day=today)
         elif (plan.buy_stop is not None and price >= plan.buy_stop
               and st.get("last_buy_day") != today and st.get("last_stop_day") != today):
-            self._buy(slot, today, f"{plan.buy_stop:,.0f}원 돌파")
+            # 계획 가격 = max(시가, 돌파 가격). 호가가 그보다 BUY_BAND 넘게 비싸면 이번엔 안 사고 다음 루프에 다시 본다
+            today_open = (self.quotes.get(slot.symbol) or {}).get("open") or price
+            self._buy(slot, today, f"{plan.buy_stop:,.0f}원 돌파", max(today_open, plan.buy_stop))
 
     def _close_out(self, slot: StockSlot) -> None:
         """'팔고 빼기'를 누른 계좌: 들고 있는 주식을 팔고, 다 팔렸으면 잔액을 금고로 뺀다 (계좌는 0원 지켜보기로 남는다)."""
@@ -459,39 +586,75 @@ class StockBot:
     # 주문 오류는 그대로 위로 올려 보낸다. 루프가 잠시 기다렸다 다시 시도하고,
     # 결과를 모르는 주문은 다음 루프의 _recover()가 토스증권에 물어서 정리한다.
 
-    def _buy(self, slot: StockSlot, today: str, reason: str) -> None:
-        s, price = self.book.slot(slot.id), self.prices[slot.symbol]
+    def _where(self, slot: StockSlot, reason: str) -> str:
+        window = self.active.get(slot.id)
+        return f"{reason} · {WINDOW_NAMES[window]}" if window in ("pre", "after") else reason
+
+    def _limit(self, slot: StockSlot, side: str) -> float:
+        """지금 낼 지정가: 그 순간의 호가 (KRX·NXT 통합)에서 바로 체결되는 값. 살 때는 가장 싼 매도 호가, 팔 때는 가장 비싼
+        매수 호가. 다시 낼 때도 그때 호가를 새로 본다 (폭등·폭락 때 처음 값에 묶이지 않게). 호가를 못 받으면 지금 가격에서 한 칸."""
+        price = self.prices[slot.symbol]
+        fetch = getattr(self.client, "best_prices", None)
+        if fetch is None:
+            return price  # 호가를 안 주는 거래소 (테스트의 가짜 거래소)
+        try:
+            ask, bid = self._call(fetch, slot.symbol)
+        except toss.TossError as e:
+            log.warning("%s 호가를 받지 못해서 지금 가격에서 한 칸으로 해요: %s", slot.symbol, e)
+            ask = bid = None
+        tick = krx.tick_size(price, self._market_info(slot.symbol).get("type") in krx.ETF_TYPES)
+        return (ask or price + tick) if side == "buy" else (bid or max(price - tick, tick))
+
+    def _buy(self, slot: StockSlot, today: str, reason: str, ref: float | None = None) -> str:
+        """그 순간의 호가로 산다. 결과: 'filled'(조금이라도 샀다) | 'none'(체결 0, 다음에 다시) |
+        'far'(호가가 계획 가격보다 BUY_BAND 넘게 비싸서 안 냈다) | 'poor'(잔액으로 1주도 못 산다)."""
+        reason = self._where(slot, reason)
+        s = self.book.slot(slot.id)
+        ref = ref or self.prices[slot.symbol]
+        limit = self._limit(slot, "buy")
+        if limit > ref * (1 + BUY_BAND):
+            log.info("%s 호가 %s원이 계획 가격 %s원보다 %s 넘게 비싸서 쫓아 사지 않아요", slot.symbol, limit, ref, BUY_BAND)
+            return "far"
         result = None
-        if s["cash"] >= price:
-            result = self._call(self.executor.buy, slot.symbol, s["cash"], price,
+        if s["cash"] >= limit:
+            result = self._call(self.executor.buy, slot.symbol, s["cash"], limit,
                                 {"slot": slot.id, "reason": reason, "day": today})
         if result is None:
             if (slot.id, today) not in self.warned:
                 self.warned.add((slot.id, today))
                 self.event("warning", f"{self._tag(slot)}매수 신호가 났지만 잔액 {s['cash']:,.0f}원으로는 1주"
-                                      f"({price:,.0f}원)도 살 수 없어요. 금고에서 이체해 주세요", notify=True)
-            return
+                                      f"({limit:,.0f}원)도 살 수 없어요. 금고에서 이체해 주세요", notify=True)
+            return "poor"
         qty, fill_price, fee = result
         if qty <= 0:
             self.executor.clear_pending()
-            self.event("warning", f"{self._tag(slot)}매수 주문이 체결되지 않아서 취소했어요 · {reason}")
-            return
+            log.info("%s 매수 주문이 체결되지 않아서 취소했어요 (다음 루프에 그때 호가로 다시) · %s", slot.symbol, reason)
+            return "none"
         trade = self.book.apply_buy(slot.id, qty, fill_price, fee, reason)
+        trade["ref"] = ref
         self.executor.clear_pending()
         self._set_sstate(slot.id, last_buy_day=today, cut=False)
         self.db.add_trade(self.executor.mode, slot.symbol, trade)
         self.event("info", f"🔴 {self._tag(slot)}매수 {qty:,}주 @ {fill_price:,.0f}원 ({trade['krw']:,.0f}원) · {reason}",
                    notify=True)
+        return "filled"
 
-    def _sell(self, slot: StockSlot, reason: str) -> None:
+    def _sell(self, slot: StockSlot, reason: str, ref: float | None = None) -> None:
+        """그 순간의 호가로 판다. 덜 팔리면 부른 쪽이 다음 루프에 그때 호가로 다시 부른다 (손절은 값을 따지지 않고 판다)."""
+        reason = self._where(slot, reason)
         s = self.book.slot(slot.id)
-        qty, fill_price, fee, tax = self._call(self.executor.sell, slot.symbol, s["qty"], self.prices[slot.symbol],
+        ref = ref or self.prices[slot.symbol]
+        qty, fill_price, fee, tax = self._call(self.executor.sell, slot.symbol, s["qty"], self._limit(slot, "sell"),
                                                {"slot": slot.id, "reason": reason})
         if qty <= 0:
             self.executor.clear_pending()
-            self.event("warning", f"{self._tag(slot)}매도 주문이 체결되지 않아서 취소했어요. 다음 루프에 다시 해요 · {reason}")
+            key = (slot.id, "sell-retry", now_kst().date().isoformat())
+            if key not in self.warned:  # 폭락 때 몇 번씩 다시 내도 알림은 한 번만
+                self.warned.add(key)
+                self.event("warning", f"{self._tag(slot)}매도 주문이 체결되지 않아서 취소했어요. 다음 루프에 그때 호가로 다시 해요 · {reason}")
             return
         trade = self.book.apply_sell(slot.id, qty, fill_price, fee, tax, reason)
+        trade["ref"] = ref
         self.executor.clear_pending()
         self.db.add_trade(self.executor.mode, slot.symbol, trade)
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
@@ -522,11 +685,11 @@ class StockBot:
             self.event("info", f"[실거래] 끊기기 전 {pending['symbol']} {side} 주문은 체결되지 않았어요. 이어서 매매해요",
                        notify=True)
 
-    def _sync(self, sess: str) -> None:
+    def _sync(self, sess: str, busy: bool = False) -> None:
         """실거래: 토스증권 실제 현금·주식으로 장부를 맞춘다 (입금·출금, 원래 있던 주식, 직접 사고판 것)."""
         if self.executor.mode != "live":
             return
-        busy = sess in ("open", "closing")
+        busy = busy or sess in ("open", "closing")
         if self.book.data.get("synced") and time.monotonic() - self.last_sync < (SYNC_SEC if busy else IDLE_REFRESH_SEC):
             return
         cash = self._call(self.client.cash)
@@ -694,7 +857,7 @@ class StockBot:
         for sym in symbols:
             self.db.delete_state(f"ranking_request:{sym}")
             old = rankings.get(sym) or {}
-            if old.get("day") == today and old.get("bars") == REGULAR_TF \
+            if old.get("day") == today and old.get("bars") == DAY_TF and old.get("tick") \
                     and (old.get("error") or len(old.get("results") or []) == len(STOCK_STRATEGIES)):
                 continue
             if not SYMBOL_PATTERN.match(sym):
@@ -707,23 +870,24 @@ class StockBot:
         try:
             ready = self._ensure_history(symbol, today, wanted)
         except toss.TossError as e:
-            rankings[symbol] = {"day": today, "bars": REGULAR_TF, "error": str(e)}
+            rankings[symbol] = {"day": today, "bars": DAY_TF, "tick": True, "error": str(e)}
             self.db.set_state("rankings", rankings)
             return
-        if not ready:  # 정규장 일봉을 만드는 중: 다음 루프에서 이어서 (웹페이지가 부탁한 종목도 잊지 않게)
+        if not ready:  # 일봉을 모으는 중: 다음 루프에서 이어서 (웹페이지가 부탁한 종목도 잊지 않게)
             self.db.set_state(f"ranking_request:{symbol}", {"at": ts()})
             return
-        candles = self.db.candle_history(symbol, wanted, REGULAR_TF)
+        candles = self.db.candle_history(symbol, wanted, DAY_TF)
         if len(candles) < backtest.WARMUP + 30:
-            rankings[symbol] = {"day": today, "bars": REGULAR_TF, "error": "상장한 지 얼마 안 돼서 과거 데이터가 부족해요"}
+            rankings[symbol] = {"day": today, "bars": DAY_TF, "tick": True, "error": "상장한 지 얼마 안 돼서 과거 데이터가 부족해요"}
             self.db.set_state("rankings", rankings)
             return
         # 앞부분은 지표 계산용 (52주 신고가처럼 긴 전략도 1년치를 보고 시작). 상장이 짧으면 있는 만큼만
         warmup = max(backtest.WARMUP, min(backtest.history_needed(STOCK_STRATEGIES), len(candles) - 30))
         params = {name: strategy_params(self.cfg, name) for name in STOCK_STRATEGIES}
         results = backtest.rank_strategies(candles, self.fee_rate, self.rank_by, TRADING_DAYS_PER_YEAR, params,
-                                           warmup=warmup, sell_cost=self.sell_tax, strategies=STOCK_STRATEGIES)
-        rankings[symbol] = {"day": today, "bars": REGULAR_TF, "computed_at": ts(), "rank_by": self.rank_by,
+                                           warmup=warmup, sell_cost=self.sell_tax, strategies=STOCK_STRATEGIES,
+                                           tick=krx.tick_fn(self._market_info(symbol, today)["type"]))
+        rankings[symbol] = {"day": today, "bars": DAY_TF, "tick": True, "computed_at": ts(), "rank_by": self.rank_by,
                             "from": candles[warmup]["day"], "to": candles[-1]["day"],
                             "days": len(candles) - warmup, "results": results}
         self.db.set_state("rankings", rankings)
@@ -742,39 +906,49 @@ class StockBot:
 
     # ---- 상태 (웹페이지·텔레그램용) ----
 
-    def _state_text(self, slot: StockSlot, sess: str, today: str) -> str:
+    def _state_text(self, slot: StockSlot, sess: str, today: str, now: datetime | None = None) -> str:
         s, plan, st = self.book.slot(slot.id), slot.plan, self._sstate(slot)
         price = self.prices.get(slot.symbol)
+        now = now or now_kst()
+        start = self._day_start(slot, today)  # 다음 거래일의 첫 거래 (NXT 종목이면 08:00)
+        window = self.active.get(slot.id)
         if slot.closing:
-            return "팔고 빼는 중 · 장중이면 바로 팔아요" if sess == "open" else "다음 장 시작(09:00)에 팔고 빼요"
-        fresh = plan is not None and slot.plan_day == today and sess in ("open", "closing")
+            return f"팔고 빼는 중 · 지금({WINDOW_NAMES[window]}) 바로 팔아요" if window else f"다음 거래 시작({start})에 팔고 빼요"
+        fresh = plan is not None and slot.plan_day == today and not self._day_over(slot, now, today)
         if s["qty"] > 0:
             loss = self._loss_line(slot)
             cut = f" · {stoploss.text(slot.stop_loss)} {loss:,.0f}원" if loss is not None else ""
             if not fresh:
-                return "보유 중 · 다음 장 시작(09:00)에 다시 판단" + cut
+                return f"보유 중 · 다음 거래 시작({start})에 다시 판단" + cut
             if slot.strategy.exit_next_open:
-                return "다음 장 시작 때 매도 예정" + cut
+                return f"다음 거래 시작({start}) 때 매도 예정" + cut
             if plan.sell_stop is not None:
                 return f"{plan.sell_stop:,.0f}원 아래로 내려가면 매도" + cut
-            return "보유 유지 · 매도 신호가 나면 다음 장 시작 때 매도" + cut
+            return f"보유 유지 · 매도 신호가 나면 다음 거래 시작({start}) 때 매도" + cut
         if price and s["cash"] < price:
             return f"잔액이 1주 가격({price:,.0f}원)보다 적어요 · 금고에서 이체해 주세요"
         if not fresh:
-            return "다음 장 시작(09:00)에 판단해요"
+            return f"다음 거래 시작({start})에 판단해요"
         if st.get("last_buy_day") == today or st.get("last_stop_day") == today:
-            return "오늘 매매 완료 · 다음 장에 다시 판단"
+            return "오늘 매매 완료 · 다음 거래일에 다시 판단"
         if st.get("cut"):
             return "손절 뒤 쉬는 중 · 매수 신호가 한 번 꺼졌다가 다시 켜지면 사요"
         if plan.buy_stop is not None:
             return f"{plan.buy_stop:,.0f}원 이상 오르면 매수"
-        return "매수 신호를 기다리는 중 · 매일 09:00 판단"
+        return f"매수 신호를 기다리는 중 · 매일 {start} 판단"
 
     def _write_status(self, now: datetime, sess: str) -> None:
         today = now.date().isoformat()
+        span = self._ext_hours(today).get(sess) if sess in ("pre", "after") else None
+        text = SESSION_TEXT[sess] + (f" · {WINDOW_NAMES[sess]} ~{span[1]}" if span and span[0] <= now.strftime("%H:%M") < span[1] else "")
+        next_open = krx.next_open(now, self.holidays)  # 다음 09:00. NXT 종목 계좌가 있으면 그날 08:00 프리마켓부터
+        if any(self._market_info(s.symbol).get("nxt") for s in self.slots):
+            early = next_open.replace(hour=int(EXT_HOURS["pre"][0][:2]), minute=int(EXT_HOURS["pre"][0][3:]))
+            if early > now:
+                next_open = early
         status = {"updated_at": ts(), "mode": self.settings["mode"], "session": sess,
-                  "session_text": SESSION_TEXT[sess], "today": today,
-                  "next_open": ts(krx.next_open(now, self.holidays)), "keys": self.client is not None,
+                  "session_text": text, "today": today,
+                  "next_open": ts(next_open), "keys": self.client is not None,
                   "ip_error": self.ip_error, "slots": [], "account": None, "broker": self.broker or None}
         if self.book is not None:
             slots, changed = [], False
@@ -804,7 +978,8 @@ class StockBot:
                     "plan": asdict(slot.plan) if slot.plan and slot.plan_day == today else None,
                     # 마지막 장의 판단 (장 밖에서도 계좌 카드에 전략마다 사자·팔자 색을 칠한다)
                     "judged": {"day": judged[0], **asdict(judged[1])} if judged else None,
-                    "state_text": self._state_text(slot, sess, today), "holding": s["qty"] > 0,
+                    "state_text": self._state_text(slot, sess, today, now), "holding": s["qty"] > 0,
+                    "venue": self.venue(slot.symbol, today),  # KRX·NXT / KRX와 사고파는 시간
                     "cash": s["cash"], "qty": s["qty"], "avg_price": s["avg_price"], "cost": s["cost"],
                     "contrib": s["contrib"], "value": value, "equity": equity,
                     "return_pct": (equity / s["contrib"] - 1) * 100 if s["contrib"] > 0 else None,
@@ -839,7 +1014,8 @@ class StockBot:
                     self.event("info", "정상으로 돌아왔어요")
                     self.last_error = None
                 pending = self.executor is not None and getattr(self.executor, "pending", lambda: None)()
-                busy = sess in ("open", "closing") or pending or self.db.states("ranking_request:")  # 순위·정규장 일봉 만드는 중이면 빨리
+                busy = (sess in ("open", "closing") or pending or self.active  # 장 밖이어도 사고팔 수 있는 계좌가 있으면 빨리
+                        or self.db.states("ranking_request:"))  # 순위 계산을 부탁받았어도 빨리
                 wait = self.interval if busy else self.idle
             except Exception as e:  # 어떤 오류가 나도 봇은 멈추지 않고 재시도한다
                 message = f"토스증권 오류: {e}" if isinstance(e, toss.TossError) else f"오류: {e!r}"
@@ -900,7 +1076,7 @@ def status_text(status: dict | None) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="My_Pie 주식 자동매매 봇 (토스증권)")
+    parser = argparse.ArgumentParser(description="AntLab 주식 자동매매 봇 (토스증권)")
     parser.add_argument("--once", action="store_true", help="한 번만 실행하고 상태를 출력")
     args = parser.parse_args()
 

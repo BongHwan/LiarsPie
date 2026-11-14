@@ -213,7 +213,7 @@ class Bot:
         if notify or level == "error":
             self._notify(message)
 
-    def _notify(self, message: str, prefix: str = "🥧 ") -> None:
+    def _notify(self, message: str, prefix: str = "🐜 ") -> None:
         """텔레그램 알림. 웹페이지 텔레그램 카드에서 '매매 알림'을 끄면 보내지 않는다."""
         if (self.db.get_state("telegram_settings") or {}).get("notify", True):
             self.notifier(prefix + message)
@@ -974,7 +974,7 @@ class Bot:
         first = text.splitlines()[0]
         log.warning(first)
         self.db.add_event("error" if expired else "warning", first)
-        self.notifier("🥧 " + text)
+        self.notifier("🐜 " + text)
 
     def _update_rankings(self, day: str) -> None:
         """종목 × 판단 주기별 전략 순위. 포트폴리오 줄은 하루 한 번, 웹페이지에서 요청한 건 바로 (한 루프에 하나씩).
@@ -1041,7 +1041,7 @@ class Bot:
     # ---- 계속 실행 ----
 
     def run(self) -> None:
-        self.event("info", f"🥧 봇 시작 · {self._describe()}", notify=True)
+        self.event("info", f"🐜 봇 시작 · {self._describe()}", notify=True)
         threading.Thread(target=self._listen_commands, name="telegram-commands", daemon=True).start()
         # SSH 로그인 알림: 보안 알림이라 웹페이지의 '매매 알림 끄기'와 상관없이 보낸다
         threading.Thread(target=sshwatch.SshWatch(self.notifier).run, args=(self.db.path, self.stop_event),
@@ -1073,7 +1073,7 @@ class Bot:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="My_Pie 자동매매 봇")
+    parser = argparse.ArgumentParser(description="AntLab 코인 자동매매 봇")
     parser.add_argument("--once", action="store_true", help="한 번만 실행하고 상태를 출력")
     args = parser.parse_args()
 

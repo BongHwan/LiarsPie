@@ -8,7 +8,7 @@ from .db import Database
 from .strategies import STOCK_STRATEGIES, STRATEGIES
 from .strategies.combo import OP_TEXT
 
-HELP = ("🥧 My_Pie 명령어\n"
+HELP = ("🐜 AntLab 명령어\n"
         "/상태 (/status) — 지금 포트폴리오와 총 자산\n"
         "/기록 (/trades) — 최근 매매 기록 10건\n"
         "/주식 (/stock) — 주식 금고와 종목 계좌\n"
@@ -209,7 +209,7 @@ def daily_text(trades: list[dict], status: dict | None) -> str:
     sells = [t for t in trades if t["side"] == "sell" and t.get("profit") is not None]
     realized = sum(t["profit"] for t in sells)
     wins = sum(t["profit"] > 0 for t in sells)
-    head = [f"📊 My_Pie 아침 리포트",
+    head = [f"📊 AntLab 아침 리포트",
             f"지난 24시간 매매 {len(trades)}건" + (f" · 확정 손익 {realized:+,.0f}원 ({wins}승 {len(sells) - wins}패)" if sells else "")]
     body = [trade_line(t) for t in trades[-15:]]
     if len(trades) > 15:

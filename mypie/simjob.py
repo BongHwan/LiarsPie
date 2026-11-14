@@ -1,4 +1,4 @@
-"""긴 기간 전략 시뮬레이션을 웹 서버와 따로 계산하는 작업 (python3 -m mypie.simjob <spec.json>).
+"""긴 기간 전략 시뮬레이션과 좋은 조합 찾기(combosearch)를 웹 서버와 따로 계산하는 작업 (python3 -m mypie.simjob <spec.json>).
 
 웹 서버가 낮은 우선순위(nice 19)로 띄워서 매매 봇을 느리게 하지 않는다. 한 번에 하나만 돈다.
 진행 상황은 simcache/job.json에 적고, simcache/job.stop 파일이 생기면 그 자리에서 멈춘다.
@@ -13,16 +13,17 @@ import sys
 import time
 from pathlib import Path
 
-from . import backtest, simulation, upbit
+from . import backtest, combosearch, simulation, telegram, upbit
 from .config import load_config
 from .db import Database
 from .history import sync_candles
-from .timeutil import ts
+from .timeutil import now_kst, ts
 
 log = logging.getLogger("mypie.simjob")
 STATE, STOP, SPEC, LOG = "job.json", "job.stop", "job_spec.json", "job.log"
 ROOT = Path(__file__).resolve().parent.parent
 WRITE_EVERY = 0.7  # 진행 상황을 이 간격(초)보다 자주 적지 않는다
+TELEGRAM_AFTER_SEC = 60  # 좋은 조합 찾기가 이보다 오래 걸렸으면 결과를 텔레그램으로도 보낸다
 _procs: list[subprocess.Popen] = []
 
 
@@ -138,20 +139,89 @@ def _fetch(db: Database, market: str, tf: str, need: int, progress: Progress) ->
         time.sleep(0.15)  # 업비트 요청 제한 배려
 
 
+def _fetch_stock(db: Database, symbol: str, need: int, progress: Progress) -> None:
+    """주식: 모자란 과거 일봉(KRX·NXT 통합)을 토스증권에서 받는다 (주식 봇과 같은 방식). 키가 없으면 모아 둔 것만."""
+    from . import toss
+    from .stockbot import sync_daily
+
+    creds = toss.load_credentials()
+    if not creds:
+        return
+    client, today = toss.TossClient(*creds, db=db), now_kst().date().isoformat()
+    progress.phase("data", need)
+    sync_daily(db, client, symbol, need, today)
+    progress.update(min(db.candle_range(symbol, "1d")[0], need))
+
+
+def _search(spec: dict, folder: Path, cfg: dict) -> str:
+    """좋은 조합 찾기: 결과를 코인·주식마다 search_<kind>.json에 쌓는다 (최근 것 몇 개 + ⭐ 저장한 것, combosearch.keep)."""
+    progress = Progress(folder, spec)
+    ctx = simulation.context(spec["kind"], cfg, spec["tf"], 0.0, spec.get("security_type"))
+    db = Database(spec["db"], create=False)
+    try:
+        need = spec["bars"] + ctx["history"]
+        if spec["kind"] == "coin":
+            _fetch(db, spec["market"], spec["tf"], need, progress)
+        else:
+            _fetch_stock(db, spec["market"], need, progress)
+        candles = db.candle_history(spec["market"], need, ctx["bars_tf"])
+        # 상장한 지 얼마 안 됐으면 있는 만큼으로 (앞 WARMUP봉은 지표 계산용, 과거 봉이 모자란 전략은 그동안 사고팔지 않는다)
+        bars = min(spec["bars"], len(candles) - backtest.WARMUP)
+        if bars < combosearch.MIN_BARS:
+            raise ValueError(f"상장한 지 얼마 안 돼서 봉이 {len(candles)}개뿐이에요. 조금 더 쌓이면 계산할 수 있어요")
+
+        def report(phase: str, done: int, total: int) -> None:
+            if progress.state.get("phase") != phase:
+                progress.phase(phase, total)
+            progress.update(done)
+
+        out = combosearch.search(candles, bars, ctx, spec.get("workers", simulation.WORKERS), report)
+        start = len(candles) - bars
+        result = {"id": spec["id"], "kind": spec["kind"], "market": spec["market"], "name": spec.get("name") or spec["market"],
+                  "tf": spec["tf"], "tf_label": spec["tf_label"], "years": spec["years"], "bars": bars,
+                  "from": candles[start]["day"][:10], "to": candles[-1]["day"][:10], "short": bars < spec["bars"],
+                  "computed_at": ts(), **out}
+        path = folder / combosearch.history_file(spec["kind"])
+        history = [r for r in (simulation.load(path) or {}).get("items", []) if r.get("id") != spec["id"]]
+        simulation.save(path, {"items": combosearch.keep([result, *history])})
+        progress.state["done"] = progress.state.get("total", 0)
+        progress.finish("done")
+        if time.time() - progress.state["started"] >= TELEGRAM_AFTER_SEC:  # 오래 걸린 건 텔레그램으로도 알린다
+            try:
+                telegram.send(combosearch.telegram_text(result))
+            except telegram.TelegramError:
+                pass
+        return "done"
+    except Stopped:
+        progress.finish("stopped", "멈췄어요")
+        return "stopped"
+    except Exception as e:
+        log.exception("조합 찾기 실패")
+        progress.finish("error", f"계산하지 못했어요 ({e})")
+        return "error"
+    finally:
+        db.close()
+
+
 def run(spec: dict, folder: Path, cfg: dict | None = None) -> str:
     """계산 작업 본체 (테스트는 이걸 바로 부른다). 끝난 상태(done·stopped·error)를 돌려준다."""
     cfg = cfg or load_config()
+    if spec.get("task") == "search":
+        return _search(spec, folder, cfg)
     progress = Progress(folder, spec)
     results = Path(spec.get("results") or folder)  # 결과 파일은 계산한 DB 옆 (상태 파일은 folder)
-    ctx = simulation.context(spec["kind"], cfg, spec["tf"], spec["stop_loss"])
+    ctx = simulation.context(spec["kind"], cfg, spec["tf"], spec["stop_loss"], spec.get("security_type"))
     db = Database(spec["db"], create=False)
     try:
-        bars, need = spec["bars"], spec["bars"] + ctx["history"]
+        need = spec["bars"] + ctx["history"]
         if spec["kind"] == "coin":
             _fetch(db, spec["market"], spec["tf"], need, progress)
+        else:
+            _fetch_stock(db, spec["market"], need, progress)
         candles = db.candle_history(spec["market"], need, ctx["bars_tf"])
-        if len(candles) - bars < backtest.WARMUP:
-            raise ValueError(f"과거 데이터가 {len(candles)}봉뿐이라 이 기간은 계산할 수 없어요")
+        bars = min(spec["bars"], len(candles) - backtest.WARMUP)  # 상장한 지 얼마 안 됐으면 있는 만큼으로 (조합 찾기와 같다)
+        if bars < combosearch.MIN_BARS:
+            raise ValueError(f"상장한 지 얼마 안 돼서 봉이 {len(candles)}개뿐이에요. 조금 더 쌓이면 계산할 수 있어요")
         base_path = results / f"{spec['base_key']}.json"
         base = simulation.load(base_path)
         combo_needed = spec.get("combo_key") and not (results / f"{spec['combo_key']}.json").exists()
@@ -161,6 +231,7 @@ def run(spec: dict, folder: Path, cfg: dict | None = None) -> str:
                                              progress.update, str(folder / STOP))
         if base is None:
             new_base["computed_at"] = ts()
+            new_base["short"] = bars < spec["bars"]
             simulation.save(base_path, new_base)
         if combo:
             simulation.save(results / f"{spec['combo_key']}.json", combo)
@@ -181,7 +252,8 @@ def run(spec: dict, folder: Path, cfg: dict | None = None) -> str:
 
 def _tidy(folder: Path, keep: int = 30) -> None:
     """오래된 결과 파일은 지운다 (최근 keep개만)."""
-    results = sorted((p for p in folder.glob("*.json") if p.name not in (STATE, SPEC)), key=lambda p: p.stat().st_mtime)
+    results = sorted((p for p in folder.glob("*.json") if p.name not in (STATE, SPEC) and not p.name.startswith("search_")),
+                     key=lambda p: p.stat().st_mtime)  # 조합 찾기 기록(search_*.json)은 따로 50개까지
     for p in results[:-keep]:
         p.unlink(missing_ok=True)
 

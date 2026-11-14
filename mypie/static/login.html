@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My_Pie 로그인</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🥧</text></svg>">
+<title>AntLab 로그인</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐜</text></svg>">
 <style>
   :root { --bg: #f3f4f8; --card: #fff; --text: #15171c; --muted: #6b7280; --line: #e7e9ee;
           --brand: #6d4aff; --brand2: #ff7a59; --ok: #16a34a; --bad: #e0313f; --soft: #f7f8fb; }
@@ -18,7 +18,7 @@
   .card { width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 28px 24px;
           box-shadow: 0 10px 40px rgba(16, 24, 40, .08); text-align: center; }
   .logo { width: 56px; height: 56px; margin: 0 auto 10px; border-radius: 16px; display: grid; place-items: center; font-size: 30px;
-          background: linear-gradient(135deg, var(--brand), var(--brand2)); }
+          background: linear-gradient(135deg, #fff1c9, #ffc56e); }  /* 개미 로고: 어느 테마에서도 잘 보이게 밝은 꿀색 */
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
   p { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
   input { width: 100%; font: inherit; font-size: 28px; letter-spacing: .4em; text-align: center; padding: 12px; border-radius: 14px;
@@ -36,8 +36,8 @@
 </head>
 <body>
 <form class="card" id="form">
-  <div class="logo">🥧</div>
-  <h1>My_Pie</h1>
+  <div class="logo">🐜</div>
+  <h1>AntLab</h1>
   <p>텔레그램으로 보낸 로그인 코드를 넣거나,<br>텔레그램에서 <b>✅ 들여보내기</b>를 누르세요</p>
   <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="__DIGITS__" placeholder="__DIGITS__자리" aria-label="로그인 코드" autofocus>
   <button type="submit" id="go">로그인</button>

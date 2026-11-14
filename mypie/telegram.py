@@ -148,7 +148,7 @@ def setup() -> None:
     if chat is None:
         sys.exit("메시지를 못 받았어요. 봇에게 메시지를 보낸 뒤 다시 실행해 주세요.")
     write_env({TOKEN: token, CHAT: str(chat)})
-    send("🥧 My_Pie와 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.", (token, str(chat)))
+    send("🐜 AntLab과 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.", (token, str(chat)))
     print("연결 완료! 텔레그램에 테스트 메시지가 갔어요.\n"
           "이제 웹페이지에 들어가면 로그인 코드가 텔레그램으로 와요. (봇을 재시작하면 매매 알림도 와요: "
           "systemctl --user restart mypie-bot)")
@@ -162,7 +162,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.test:
         try:
-            send("🥧 My_Pie 테스트 메시지예요.")
+            send("🐜 AntLab 테스트 메시지예요.")
             print("보냈어요. 텔레그램을 확인하세요.")
         except TelegramError as e:
             sys.exit(f"실패: {e}")

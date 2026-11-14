@@ -22,6 +22,69 @@
       --c6: #4ade80; --c7: #22d3ee; --c8: #c084fc; --c9: #fb923c; --c10: #a3e635; --c11: #fb7185;
     }
   }
+
+  /* 테마 (위쪽 🎨 버튼에서 고르고 이 기기에 기억한다, theme.js): 1 라이트 퍼플은 위 기본값. 2는 늘 어둡고, 3·4·5는 폰이 어두운 모드면 어둡게 */
+  :root[data-theme="2"] {  /* 2 다크 트레이딩: 짙은 남색 + 민트 */
+    color-scheme: dark;
+    --bg: #0b1019; --card: #141b27; --soft: #1a2332; --text: #e6eaf2; --muted: #93a0b5; --line: #243045;
+    --up: #ff5c6c; --down: #4f8fff; --ok: #34d399; --warn: #f0b04d; --bad: #ff5c6c;
+    --brand: #2dd4bf; --brand2: #60a5fa; --brand-soft: #10302d;
+    --chip: #1d2738; --paper-bg: #3a2f12; --paper-fg: #f3c565; --live-bg: #3d1a1e; --live-fg: #ff8d98;
+    --accent: #e6eaf2; --accent-fg: #0b1019; --active: #12302d;
+    --warn-bg: #2b2112; --warn-line: #5a4320; --bad-bg: #2a1417; --bad-line: #5c2a31; --info-bg: #10233a; --info-line: #24406a;
+    --shadow: none;
+    --c1: #2dd4bf; --c2: #60a5fa; --c3: #fbbf24; --c4: #f472b6; --c5: #8b95a5;
+    --c6: #4ade80; --c7: #a78bfa; --c8: #c084fc; --c9: #fb923c; --c10: #a3e635; --c11: #fb7185;
+  }
+  :root[data-theme="3"] {  /* 3 깔끔한 화이트 블루 */
+    --bg: #f2f4f6; --card: #ffffff; --soft: #f7f8fa; --text: #191f28; --muted: #6b7684; --line: #e5e8eb;
+    --up: #f04452; --down: #3182f6; --ok: #10b981; --warn: #f59e0b; --bad: #f04452;
+    --brand: #3182f6; --brand2: #00c4b4; --brand-soft: #e8f3ff;
+    --chip: #f2f4f6; --active: #e8f3ff; --accent: #191f28; --accent-fg: #ffffff;
+    --shadow: 0 1px 3px rgba(0, 27, 55, .06);
+    --c1: #3182f6; --c2: #00c4b4; --c3: #ffb331; --c4: #f06595; --c5: #8b95a1;
+  }
+  :root[data-theme="4"] {  /* 4 차분한 종이: 아이보리 + 남색 */
+    --bg: #f4efe6; --card: #fffdf8; --soft: #f8f3ea; --text: #2b2a26; --muted: #6f6a5f; --line: #e6dece;
+    --up: #c8372d; --down: #2563a8; --ok: #3f7d4e; --warn: #b7791f; --bad: #c8372d;
+    --brand: #1e3a5f; --brand2: #c2410c; --brand-soft: #e7edf5;
+    --chip: #eee7d9; --active: #e7edf5; --accent: #1e3a5f; --accent-fg: #fffdf8;
+    --paper-bg: #f5e7c8; --paper-fg: #7a5410;
+    --shadow: 0 1px 2px rgba(60, 45, 20, .06);
+    --c1: #1e3a5f; --c2: #2f855a; --c3: #c2410c; --c4: #9b2c6b; --c5: #8a8475;
+  }
+  :root[data-theme="5"] {  /* 5 벚꽃 핑크: 연분홍 바탕 + 진분홍 포인트 */
+    --bg: #fff3f7; --card: #ffffff; --soft: #fff0f5; --text: #3b2430; --muted: #8e6a7b; --line: #f7dbe6;
+    --up: #e8335f; --down: #4d7cf0; --ok: #1fa971; --warn: #d9822b; --bad: #e8335f;
+    --brand: #ff4f9a; --brand2: #ff9cc8; --brand-soft: #ffe3ef;
+    --chip: #ffe8f1; --active: #ffe3ef; --accent: #3b2430; --accent-fg: #ffffff;
+    --live-bg: #ffe0ea; --live-fg: #c2185b;
+    --shadow: 0 1px 3px rgba(190, 60, 120, .08), 0 4px 16px rgba(190, 60, 120, .06);
+    --c1: #ff4f9a; --c2: #a78bfa; --c3: #ffb547; --c4: #34c3c9; --c5: #b39aa8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root[data-theme="5"] {
+      --bg: #1c1117; --card: #271921; --soft: #2f1f29; --text: #f7e7ef; --muted: #b996a8; --line: #3e2a35;
+      --up: #ff6b8e; --down: #6e9fff; --ok: #3ad07f; --warn: #f0b04d; --bad: #ff6b8e;
+      --brand: #ff79b4; --brand2: #ffb3d4; --brand-soft: #3b1a2c;
+      --chip: #35212d; --active: #3b1a2c; --accent: #f7e7ef; --accent-fg: #1c1117;
+      --live-bg: #3d1a28; --live-fg: #ff9cbc; --shadow: none;
+      --c1: #ff79b4; --c2: #c4a8ff; --c3: #ffc56b; --c4: #4fd6dc; --c5: #a58b99;
+    }
+    :root[data-theme="3"] {
+      --bg: #101317; --card: #1b1e24; --soft: #22262d; --text: #e9ebee; --muted: #9aa3ad; --line: #2c3138;
+      --up: #ff5b6b; --down: #4c96ff; --brand: #4c96ff; --brand2: #2ee6d6; --brand-soft: #13263f;
+      --chip: #22262d; --active: #13263f; --accent: #e9ebee; --accent-fg: #101317; --shadow: none;
+      --c1: #4c96ff; --c2: #2ee6d6;
+    }
+    :root[data-theme="4"] {
+      --bg: #1a1814; --card: #24211c; --soft: #2b2822; --text: #ece6da; --muted: #a59d8e; --line: #3a352d;
+      --up: #f0705f; --down: #6ea0e0; --brand: #8fb3dd; --brand2: #f0905a; --brand-soft: #1f2a38;
+      --chip: #2e2a23; --active: #1f2a38; --accent: #ece6da; --accent-fg: #1a1814;
+      --paper-bg: #3a2f12; --paper-fg: #f3c565; --shadow: none;
+      --c1: #8fb3dd; --c2: #68b98a; --c3: #f0905a; --c4: #e07fb0;
+    }
+  }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
   [id] { scroll-margin-top: 120px; }  /* 위 메뉴로 이동할 때 고정된 상단바에 가리지 않게 */
@@ -39,10 +102,12 @@
   .top-in { max-width: 1180px; margin: 0 auto; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 20px; letter-spacing: -0.03em; margin-right: 4px; }
   .brand .logo { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-size: 17px;
-                 background: linear-gradient(135deg, var(--brand), var(--brand2)); }
+                 background: linear-gradient(135deg, #fff1c9, #ffc56e); }  /* 개미 로고: 어느 테마에서도 잘 보이게 밝은 꿀색 */
   .chip { background: var(--chip); color: var(--muted); border-radius: 999px; padding: 2px 10px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
   .chip.paper { background: var(--paper-bg); color: var(--paper-fg); }
   .chip.live { background: var(--live-bg); color: var(--live-fg); }
+  .chip.venue { font-size: 11.5px; letter-spacing: .02em; }            /* 주식 계좌의 거래소: KRX / KRX·NXT */
+  .chip.venue.nxt { background: var(--brand-soft); color: var(--brand); }
   .top-right { margin-left: auto; display: flex; align-items: center; gap: 14px; font-size: 13px; color: var(--muted); }
   .gear { font-size: 16px; line-height: 1; padding-inline: 9px; position: relative; }
   .gear.warn::after { content: ""; position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; border-radius: 50%;
@@ -64,6 +129,20 @@
   .set-sec .steps, .set-sec .tg-open { margin-bottom: 4px; }
   .set-sec .msg { margin-top: 0; }
   .set-sec .keys { border-top: 1px solid var(--line); padding: 10px 0 0; }  /* 🔑 키 넣기 */
+  /* 🎨 테마 버튼 (theme.js): 누르면 아래에 고르는 칸 */
+  .theme-wrap { position: relative; display: inline-flex; }
+  .theme-pop { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; width: min(270px, calc(100vw - 32px));
+               display: grid; gap: 2px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+               box-shadow: 0 12px 32px rgba(0, 0, 0, .16); }
+  .theme-pop[hidden] { display: none; }
+  .theme-pop button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 0; padding: 8px 10px; border: 0;
+                      border-radius: 10px; background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+  .theme-pop button:hover { background: var(--soft); }
+  .theme-pop button[aria-checked="true"] { background: var(--brand-soft); box-shadow: inset 0 0 0 1.5px var(--brand); }
+  .theme-pop b { display: block; font-size: 14px; }
+  .theme-pop small { display: block; color: var(--muted); font-size: 12px; }
+  .theme-dots { display: flex; gap: 4px; }
+  .theme-dots i { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .08); }
   .set-sec .keys .steps { margin: 8px 0; }
   .set-sec .keys .field { margin-bottom: 6px; }
   @media (max-width: 560px) { .settings-panel { margin: 0; padding: 12px; } }
@@ -72,9 +151,15 @@
   .dot.ok { background: var(--ok); animation: pulse 2s infinite; }
   .dot.bad { background: var(--bad); }
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 50% { box-shadow: 0 0 0 5px transparent; } }
-  nav.jump { width: 100%; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
-  nav.jump a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 8px; white-space: nowrap; }
-  nav.jump a:hover { background: var(--chip); color: var(--text); }
+  /* 탭 4개 (tabs.js): 고른 탭의 칸만 보인다 */
+  nav.tabs { width: 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; padding: 3px;
+             background: var(--chip); border-radius: 12px; }
+  nav.tabs button { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 14px; font-weight: 650;
+                    min-height: 0; padding: 7px 2px; border-radius: 9px; cursor: pointer; white-space: nowrap; }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button[aria-selected="true"] { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
+  body[data-tab="home"] [data-tab]:not([data-tab="home"]), body[data-tab="research"] [data-tab]:not([data-tab="research"]),
+  body[data-tab="records"] [data-tab]:not([data-tab="records"]), body[data-tab="pi"] [data-tab]:not([data-tab="pi"]) { display: none !important; }
 
   /* 공통 카드 */
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; min-width: 0; box-shadow: var(--shadow); }
@@ -132,9 +217,14 @@
   .ring-text { min-width: 0; }
   .ring-text .sub { white-space: normal; }  /* 좁으면 카드 밖으로 넘치지 않고 두 줄로 */
   @media (max-width: 480px) { .hero { grid-template-columns: 1fr; } }  /* 휴대폰: 카드를 한 줄에 하나씩 */
+  .hero.four { grid-template-columns: 2fr 1fr 1fr 1fr; }  /* 코인 개요: 총 자산 · 다음 판단 · 고른 종목 · 금고 */
+  @media (max-width: 1000px) { .hero.four { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 480px) { .hero.four { grid-template-columns: 1fr; } }
 
   .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
   @media (max-width: 760px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .kpis.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }  /* 기록 탭: 실현 손익 · 승률 · 최대 낙폭 */
+  @media (max-width: 560px) { .kpis.three { grid-template-columns: 1fr 1fr; } }
 
   /* 종목 카드 */
   .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }  /* 펼친 카드는 줄을 바꿔 한 줄을 다 쓴다 (순서는 그대로) */
@@ -150,8 +240,22 @@
   .slot-strat b { font-weight: 650; }
   .slot-state { font-size: 13px; color: var(--muted); margin-top: 2px; }
   .slot-when { font-size: 12.5px; color: var(--muted); margin-top: 6px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-  .slot-foot { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
-  .slot-foot .tile.wide { grid-column: 1 / -1; }
+  /* 펼친 카드 숫자 칸 (slotnums.js): 이 전략 vs 그냥 들고 있었다면 비교표 + 한 줄 판정 + 계좌 금액 줄들 */
+  .slot-nums { background: var(--soft); border-radius: 12px; padding: 10px 12px; margin-top: 10px; }
+  .cmp-t { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 14px; }
+  .cmp-t th { font-size: 12px; font-weight: 600; color: var(--muted); text-align: right; padding: 0 0 4px; line-height: 1.3; }
+  .cmp-t td { text-align: right; padding: 5px 0; border-top: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cmp-t th:first-child, .cmp-t td:first-child { text-align: left; color: var(--muted); width: 22%; }
+  .cmp-t td.me { font-weight: 700; font-size: 15.5px; }
+  .cmp-verdict { font-size: 13.5px; font-weight: 650; margin-top: 6px; }
+  .nums-rows { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; font-size: 13.5px;
+               margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .nums-rows .k { color: var(--muted); }
+  .nums-rows .v { text-align: right; }
+  .nums-rows .indent { padding-left: 10px; }
+  .nums-rows .indent::before { content: '└ '; opacity: .6; }
+  .nums-rows b { font-weight: 650; }
+  .nums-rows .sub-line { grid-column: 1 / -1; text-align: right; color: var(--muted); font-size: 12px; margin-top: -3px; }
   .wbar { height: 6px; border-radius: 3px; background: var(--soft); margin-top: 10px; position: relative; overflow: hidden; }
   .wbar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
   .wbar b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: .5; }
@@ -257,7 +361,7 @@
   .simbar .simrule { grid-column: 1 / -1; }  /* 살 때·팔 때 전략은 아랫줄 전체 */
   .simbar select { width: 100%; min-width: 0; color: var(--text); }
   @media (max-width: 640px) { .simbar { grid-template-columns: 1fr 1fr; } }
-  .simline { font-size: 15px; margin: 14px 0 10px; line-height: 1.6; }
+  .simline { font-size: 14px; margin: 14px 0 10px; line-height: 1.6; }
   .simline b { font-weight: 750; }
   .simjob { border: 1px solid var(--info-line); background: var(--info-bg); border-radius: 12px; padding: 10px 12px; margin: 0 0 12px; display: grid; gap: 8px; }
   .simjob-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
@@ -265,8 +369,12 @@
   .simjob-bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
   .simjob-bar i { display: block; height: 100%; border-radius: 4px; background: var(--brand); transition: width .6s; }
   .simjob-note { font-size: 12.5px; }
-  .simtiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
-  @media (max-width: 760px) { .simtiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .simline .sim-note { display: block; font-size: 13px; color: var(--muted); }
+  /* 시뮬레이션 숫자: 왼쪽 이 전략 vs 그냥 들고 있었다면 표, 오른쪽 사고판 횟수 · 순위 · 마지막 (slotnums.js) */
+  .simtiles { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 8px; margin-bottom: 12px; align-items: start; }
+  .simtiles .slot-nums { margin-top: 0; }
+  .nums-rows.sim-more { border-top: 0; padding-top: 10px; }
+  @media (max-width: 760px) { .simtiles { grid-template-columns: minmax(0, 1fr); } }
   .subhead { font-size: 14px; margin: 18px 0 6px; padding-top: 14px; border-top: 1px solid var(--line); }
   .tag { font-size: 11px; font-weight: 700; color: var(--brand); margin-left: 6px; }
   .tag.combo { margin: 0 6px 0 0; color: var(--up); }  /* 전략 순위의 '조합' 줄 */
@@ -338,9 +446,6 @@
   .seg.switch a + a { border-left: 1px solid var(--line); }
   .seg.switch a[aria-current=page] { background: var(--accent); color: var(--accent-fg); font-weight: 700; }
 
-  /* 카드의 '(바이앤홀드 …)' 비교 줄 */
-  .hold-line { font-size: 12px; margin-top: 2px; opacity: .85; }
-
   /* 차트 기간 버튼 8개: 좁은 화면(폰)에서는 콤보 하나로 바꾼다 */
   .range-select { display: none; min-height: 34px; padding: 4px 10px; font-size: 13px; }
   @media (max-width: 640px) { .seg.ranges { display: none; } .range-select { display: inline-block; margin-left: auto; } }
@@ -373,7 +478,7 @@
   @media (min-width: 720px) {  /* 펼친 카드는 한 줄을 다 쓰고 왼쪽 · 오른쪽으로 */
     .slots > .slot-card.open { grid-column: 1 / -1; }
     .slot-card.open .slot-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr); align-items: start; }
-    .slot-card.open .slot-foot { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 6px; }
+    .slot-card.open .slot-nums { margin-top: 6px; }
   }
   .slot-sum .label { font-size: 13px; font-weight: 400; color: var(--muted); }
   .curve { margin-top: 10px; padding: 10px 12px; border-radius: 12px; background: var(--soft); font-size: 12.5px; color: var(--muted); }
@@ -386,6 +491,44 @@
   .curve-foot { font-size: 11px; }
   .curve-legend { display: flex; gap: 4px 10px; flex-wrap: wrap; }
   .c-strat { color: var(--brand); font-weight: 650; }
+  /* 좋은 조합 찾기 (finder.js) */
+  .finder-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .slot-card.flash { animation: flash 0.8s ease-in-out 3; }
+  @keyframes flash { 50% { box-shadow: 0 0 0 4px var(--brand); } }
+  .finder-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .finder-form select { flex: 1 1 140px; min-width: 0; }
+  .finder-search { flex: 2 1 200px; min-width: 0; }
+  /* 종목 찾는 칸 (이름이나 코드를 치면 아래에 목록) */
+  .search { position: relative; }
+  .search input { width: 100%; font: inherit; border-radius: 10px; border: 1px solid var(--line); padding: 9px 12px; min-height: 42px;
+                  background: var(--card); color: var(--text); }
+  .suggest { position: absolute; left: 0; right: 0; top: 46px; z-index: 6; background: var(--card); border: 1px solid var(--line);
+             border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.12); max-height: 280px; overflow-y: auto; }
+  .suggest button { display: flex; justify-content: space-between; gap: 8px; width: 100%; border: 0; border-radius: 0; min-height: 40px;
+                    background: transparent; text-align: left; }
+  .suggest button:hover, .suggest button:focus { background: var(--soft); }
+  .suggest small { color: var(--muted); }
+  .finder-hist { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .finder-hist select { flex: 1 1 200px; min-width: 0; font-size: 13px; }
+  .finder-result { margin-top: 12px; }
+  .finder-head { font-size: 14px; }
+  .finder-sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .finder-short { display: block; font-size: 13px; color: var(--warn); margin-top: 4px; }  /* 상장한 지 얼마 안 돼 있는 만큼만 계산 */
+  .finder-head button { margin-left: 4px; vertical-align: middle; }
+  .finder-list { margin: 8px 0; }
+  .finder-row { display: grid; grid-template-columns: 2em minmax(0, 1fr) auto; gap: 4px 10px; align-items: center;
+                padding: 9px 0; border-top: 1px solid var(--line); }
+  .finder-rank { font-weight: 800; color: var(--muted); text-align: center; }
+  .finder-rule { font-size: 14px; }
+  .finder-top { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin-top: 2px; }
+  .finder-ret { font-size: 17px; font-weight: 800; }
+  .finder-ok { font-size: 12.5px; font-weight: 700; color: var(--ok); white-space: nowrap; }
+  .finder-stats { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .finder-stat { background: var(--soft); border-radius: 8px; padding: 2px 8px; font-size: 12.5px; white-space: nowrap; }
+  .finder-stat small { color: var(--muted); font-size: 12px; }
+  .finder-stat b { font-weight: 700; }
+  .finder-same { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  @media (max-width: 560px) { .finder-row { grid-template-columns: 1.6em minmax(0, 1fr); } .finder-acts { grid-column: 2; justify-content: flex-start; } }
   /* 살 때 · 팔 때 전략 고르기 (rules.js) */
   .rule { display: grid; gap: 6px; min-width: 0; }
   .rule-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
@@ -397,6 +540,8 @@
   .rule-tag.stop { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
   .stopline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); min-width: 0; }
   .stopline .toggle { gap: 6px; }
+  .stopline .stop-rest { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .simbar .stopline .toggle { display: flex; font-size: 13px; color: inherit; }  /* .simbar label(grid)보다 먼저 */
   .stopline input[type=number] { width: 72px; text-align: right; color: var(--text); }
   .stopline input[type=number]:disabled { opacity: .45; }
   .seg.rule-op button { min-height: 30px; padding: 2px 9px; font-size: 12px; }
