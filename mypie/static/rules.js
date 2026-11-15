@@ -12,11 +12,39 @@ function normalizeRule(r) {
 }
 function isSimpleRule(r) { return r.buy.length === 1 && r.sell.length === 1 && r.buy[0] === r.sell[0]; }
 function sameRule(a, b) { return JSON.stringify(normalizeRule(a)) === JSON.stringify(normalizeRule(b)); }
+function sameCombo(a, b) {  // 그리고·또는은 순서가 상관없어서, 순서만 다른 조합도 같은 조합으로 본다
+  const key = (r) => { r = normalizeRule(r); return JSON.stringify([[...r.buy].sort(), r.buy_op, [...r.sell].sort(), r.sell_op]); };
+  return key(a) === key(b);
+}
 function ruleText(r, labelOf) {
   r = normalizeRule(r);
   if (isSimpleRule(r)) return labelOf(r.buy[0]);
   const side = (names, op) => names.map(labelOf).join(` ${RULE_OP_TEXT[op]} `);
   return `살 때 ${side(r.buy, r.buy_op)} · 팔 때 ${side(r.sell, r.sell_op)}`;
+}
+// 계좌 카드의 전략 이름: 이번 봉 판단이 사자면 빨강, 팔자면 파랑 (x는 봇이 보낸 계좌 하나)
+//   조합은 봇이 전략마다 '혼자였다면 지금 들고 있을까'를 plan.signals로 준다.
+//   전략 하나면 계획 그대로: 사자 · 팔자, 그 밖에는 지금 들고 있으면 사자(보유 유지), 아니면 팔자(관망)
+//   주식은 장 밖에서도 마지막 장의 판단(judged)으로 칠한다
+function ruleSignals(x) {
+  const p = x.plan || x.judged;
+  if (!p) return {};
+  if (p.signals) return p.signals;
+  const name = normalizeRule(x.rule).buy[0];
+  if (p.note.startsWith('데이터 부족')) return { [name]: null };
+  return { [name]: p.buy_at_open ? true : p.sell_at_open ? false : !!x.holding };
+}
+function ruleNodes(r, labelOf, signals) {
+  r = normalizeRule(r);
+  const name = (n) => {
+    const s = signals[n], label = labelOf(n);
+    if (s == null) return el('span', n in signals ? { text: label, title: `${label}: 데이터 부족` } : { text: label });
+    return el('span', { class: s ? 'sig-buy' : 'sig-sell', text: label,
+      title: s ? `${label}: 사자 (혼자였다면 지금 들고 있어요)` : `${label}: 팔자 (혼자였다면 지금 안 들고 있어요)` });
+  };
+  if (isSimpleRule(r)) return [name(r.buy[0])];
+  const side = (names, op) => names.flatMap((n, i) => (i ? [` ${RULE_OP_TEXT[op]} `, name(n)] : [name(n)]));
+  return ['살 때 ', ...side(r.buy, r.buy_op), ' · 팔 때 ', ...side(r.sell, r.sell_op)];
 }
 function ruleQuery(r) {  // 시뮬레이션 요청에 붙이는 값
   r = normalizeRule(r);
@@ -92,8 +120,8 @@ function stopField(pct, onChange) {
     if (p > 0) num.value = p;
     num.disabled = !on.checked;
   };
-  box.append(el('label', { class: 'toggle' }, on, el('span', { class: 'rule-tag stop', text: '손절선' })),
-             el('span', { text: '산 값보다 −' }), num, el('span', { text: '% 떨어지면 팔기' }));
+  box.append(el('label', { class: 'toggle' }, on, el('span', { class: 'rule-tag stop', text: '손절선' })),  // 좁으면 뒷부분이 통째로 다음 줄로
+             el('span', { class: 'stop-rest' }, el('span', { text: '산 값보다 −' }), num, el('span', { text: '% 떨어지면 팔기' })));
   return box;
 }
 function stopText(pct) { return pct > 0 ? `손절선 −${pct}%` : ''; }

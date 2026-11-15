@@ -99,7 +99,7 @@
     } catch (e) {}
   }
   async function refreshCores() {
-    if (document.visibilityState !== 'visible') return;  // 안 보고 있으면 묻지 않는다 (파이는 5분 뒤 재기를 쉰다)
+    if (document.visibilityState !== 'visible' || !box.offsetParent) return;  // 안 보고 있거나 다른 탭이면 묻지 않는다 (파이는 5분 뒤 재기를 쉰다)
     try {
       const r = await fetch('/api/cpu', { cache: 'no-store' });
       if (r.ok) renderCores(await r.json());

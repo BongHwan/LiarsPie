@@ -55,12 +55,34 @@ def call(token: str, method: str, params: dict | None = None, timeout: float = 8
     return body["result"]
 
 
-def send(text: str, creds: tuple[str, str] | None = None) -> None:
+def keyboard(buttons: list | None) -> dict | None:
+    """메시지 아래 버튼. buttons의 칸마다 (글자, 누르면 봇에게 오는 값)이면 그 버튼 하나가 한 줄,
+    [(글자, 값), ...] 목록이면 그 버튼들이 한 줄에 나란히."""
+    if not buttons:
+        return None
+    rows = [[b] if isinstance(b, tuple) else list(b) for b in buttons]
+    return {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row] for row in rows]}
+
+
+def send(text: str, creds: tuple[str, str] | None = None, buttons: list | None = None) -> None:
+    """buttons: 메시지 아래 버튼 (keyboard 참고)."""
     creds = creds or load()
     if not creds:
         raise TelegramError("텔레그램이 연결되지 않았어요 (python3 -m mypie.telegram)")
     token, chat = creds
-    call(token, "sendMessage", {"chat_id": chat, "text": text, "disable_web_page_preview": True})
+    params = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    if buttons:
+        params["reply_markup"] = keyboard(buttons)
+    call(token, "sendMessage", params)
+
+
+def edit(message_id: int, text: str, creds: tuple[str, str], buttons: list | None = None) -> None:
+    """이미 보낸 메시지의 글과 버튼을 바꾼다 (버튼을 안 주면 버튼이 사라진다). 글이 그대로면 텔레그램이 거절한다."""
+    token, chat = creds
+    params = {"chat_id": chat, "message_id": message_id, "text": text, "disable_web_page_preview": True}
+    if buttons:
+        params["reply_markup"] = keyboard(buttons)
+    call(token, "editMessageText", params)
 
 
 class Notifier:
@@ -70,21 +92,21 @@ class Notifier:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self.queue: queue.Queue[str] = queue.Queue(maxsize=100)
+        self.queue: queue.Queue[tuple[str, list | None]] = queue.Queue(maxsize=100)
         self.sent: deque[float] = deque()
         threading.Thread(target=self._worker, name="telegram", daemon=True).start()
 
-    def __call__(self, text: str) -> None:
+    def __call__(self, text: str, buttons: list[tuple[str, str]] | None = None) -> None:
         if not self.enabled:
             return
         try:
-            self.queue.put_nowait(text)
+            self.queue.put_nowait((text, buttons))
         except queue.Full:
             pass
 
     def _worker(self) -> None:
         while True:
-            text = self.queue.get()
+            text, buttons = self.queue.get()
             now = time.monotonic()
             while self.sent and now - self.sent[0] > 3600:
                 self.sent.popleft()
@@ -94,7 +116,7 @@ class Notifier:
             if not creds:
                 continue
             try:
-                send(text, creds)
+                send(text, creds, buttons)
                 self.sent.append(now)
             except TelegramError as e:
                 log.warning("텔레그램 알림 실패: %s", e)
@@ -126,7 +148,7 @@ def setup() -> None:
     if chat is None:
         sys.exit("메시지를 못 받았어요. 봇에게 메시지를 보낸 뒤 다시 실행해 주세요.")
     write_env({TOKEN: token, CHAT: str(chat)})
-    send("🥧 My_Pie와 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.", (token, str(chat)))
+    send("🐜 AntLab과 연결됐어요!\n이제 웹페이지 로그인 코드와 매매 알림이 여기로 와요.", (token, str(chat)))
     print("연결 완료! 텔레그램에 테스트 메시지가 갔어요.\n"
           "이제 웹페이지에 들어가면 로그인 코드가 텔레그램으로 와요. (봇을 재시작하면 매매 알림도 와요: "
           "systemctl --user restart mypie-bot)")
@@ -140,7 +162,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.test:
         try:
-            send("🥧 My_Pie 테스트 메시지예요.")
+            send("🐜 AntLab 테스트 메시지예요.")
             print("보냈어요. 텔레그램을 확인하세요.")
         except TelegramError as e:
             sys.exit(f"실패: {e}")

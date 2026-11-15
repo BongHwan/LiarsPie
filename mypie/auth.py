@@ -1,5 +1,5 @@
-"""웹페이지 로그인: 텔레그램으로 받은 코드를 넣으면 그 기기는 한동안 로그인된 상태로 둔다.
-로그인한 IP도 하루 동안은 다시 묻지 않는다.
+"""웹페이지 로그인: 텔레그램으로 받은 코드를 넣거나, 같은 메시지의 [✅ 들여보내기] 버튼을 누르면
+그 기기는 한동안 로그인된 상태로 둔다. 로그인한 IP도 하루 동안은 다시 묻지 않는다.
 
 코드와 로그인 정보는 원문 대신 해시로만 DB에 남긴다. 웹 서버가 재시작돼도 로그인은 유지된다.
 """
@@ -21,6 +21,7 @@ MAX_ATTEMPTS = 3          # 한 코드로 틀릴 수 있는 횟수 (넘으면 �
 RESEND_SEC = 30           # 코드를 다시 보낼 수 있는 간격
 MAX_SENDS_PER_HOUR = 10   # 텔레그램 폭탄 방지
 MAX_SESSIONS = 20
+ASK_PREFIX = "login_ask:"  # 버튼으로 들여보내기를 기다리는 로그인 요청 (요청마다 따로)
 
 
 class TooSoon(Exception):
@@ -63,6 +64,46 @@ def check_code(db: Database, code: str) -> tuple[bool, str]:
         return False, "여러 번 틀려서 코드를 지웠어요. 새 코드를 받아 주세요."
     db.set_state(CODE_KEY, stored)
     return False, f"코드가 틀렸어요. (남은 기회 {MAX_ATTEMPTS - stored['attempts']}번)"
+
+
+# 버튼으로 들여보내기: 로그인 화면이 코드를 받을 때 요청 번호(ask)도 같이 받고, 몇 초마다 결과를 묻는다.
+# 텔레그램 [✅ 들여보내기]·[🙅 거절]을 누르면 봇이 그 요청에 답을 적는다. 요청한 IP에서 물을 때만 들여보낸다.
+
+def open_ask(db: Database, ip: str) -> str:
+    now = time.time()
+    for key, ask in db.states(ASK_PREFIX):  # 지난 요청 정리
+        if ask["expires"] < now:
+            db.delete_state(key)
+    ask_id = secrets.token_urlsafe(12)
+    db.set_state(ASK_PREFIX + ask_id, {"ip": ip, "expires": now + CODE_TTL_SEC, "answer": None})
+    return ask_id
+
+
+def answer_ask(db: Database, ask_id: str, allow: bool) -> dict | None:
+    """텔레그램 버튼의 답을 적는다. 거절하면 그 코드도 못 쓰게 지운다. 요청이 없거나 지났으면 None."""
+    key = ASK_PREFIX + ask_id
+    ask = db.get_state(key)
+    if not ask or ask["expires"] < time.time() or ask["answer"] is not None:
+        return None
+    ask["answer"] = "yes" if allow else "no"
+    db.set_state(key, ask)
+    if not allow:
+        db.delete_state(CODE_KEY)
+    return ask
+
+
+def take_ask(db: Database, ask_id: str, ip: str) -> str:
+    """로그인 화면이 묻는다: 'yes'(들여보냄, 한 번만) · 'no'(거절) · 'wait'(아직) · 'gone'(없거나 지남)."""
+    key = ASK_PREFIX + ask_id
+    ask = db.get_state(key) if ask_id else None
+    if not ask or ask["ip"] != ip:
+        return "gone"
+    if ask["answer"] is None:
+        return "wait" if ask["expires"] >= time.time() else "gone"
+    db.delete_state(key)
+    if ask["answer"] == "yes":
+        db.delete_state(CODE_KEY)  # 버튼으로 들어왔으니 코드는 더 필요 없다
+    return ask["answer"]
 
 
 def create_session(db: Database, hours: float, info: dict) -> str:

@@ -81,9 +81,13 @@ class Database:
                 with self.conn:  # 예전 일봉 표를 새 표로 옮기기
                     self.conn.execute("INSERT OR IGNORE INTO bars SELECT market, '1d', day, open, high, low, close, volume "
                                       "FROM candles")
-            if "slot" not in {row["name"] for row in self.conn.execute("PRAGMA table_info(trades)")}:
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(trades)")}
+            if "slot" not in columns:
                 with self.conn:  # 어느 계좌(줄)의 매매인지 (같은 종목 계좌가 여럿일 수 있어서)
                     self.conn.execute("ALTER TABLE trades ADD COLUMN slot TEXT")
+            if "ref" not in columns:
+                with self.conn:  # 계획 가격 (시가·돌파 가격·손절선 등). 실제 체결가와 비교해서 체결 오차를 본다
+                    self.conn.execute("ALTER TABLE trades ADD COLUMN ref REAL")
         # WAL에서는 NORMAL이어도 안전하고, SD카드 쓰기가 줄어든다
         self.conn.execute("PRAGMA synchronous=NORMAL")
 
@@ -135,10 +139,10 @@ class Database:
     def add_trade(self, mode: str, market: str, trade: dict) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO trades (ts, mode, market, side, price, volume, krw, fee, profit, reason, slot) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO trades (ts, mode, market, side, price, volume, krw, fee, profit, reason, slot, ref) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts(), mode, market, trade["side"], trade["price"], trade["volume"], trade["krw"],
-                 trade["fee"], trade.get("profit"), trade.get("reason", ""), trade.get("slot")),
+                 trade["fee"], trade.get("profit"), trade.get("reason", ""), trade.get("slot"), trade.get("ref")),
             )
 
     def add_event(self, level: str, message: str) -> None:

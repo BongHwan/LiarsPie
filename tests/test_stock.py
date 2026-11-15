@@ -45,6 +45,7 @@ class FakeToss:
         self.reject = False
         self.closed = set()  # 장이 안 열리는 날
         self.nxt, self.regular_, self.regular_calls = set(), {}, []  # 넥스트레이드 종목, 정규장 일봉, 받아 간 날
+        self.types = {}  # 종목 종류 (없으면 STOCK = 보통 주식)
 
     def set(self, symbol, day, price, today_open=None, prev=None):
         """오늘(day) 시세와, 어제까지 일봉 + 오늘 진행 중인 일봉."""
@@ -64,6 +65,9 @@ class FakeToss:
 
     def nxt_supported(self, symbols):
         return {s: s in self.nxt for s in symbols}
+
+    def market_info(self, symbols):
+        return {s: {"nxt": s in self.nxt, "nxt_halt": False, "type": self.types.get(s, "STOCK")} for s in symbols}
 
     def regular_day(self, symbol, day):
         """정규장만의 일봉: 따로 정해 두지 않았으면 일봉과 같다 (NXT가 아닌 종목처럼)."""
@@ -245,6 +249,21 @@ class StockBotTest(TempDb):
     def slot(self, bot):
         return next(iter(bot.book.data["slots"].values()))
 
+    def test_new_keys_are_used_without_a_restart(self):
+        """⚙️ 설정에서 키를 바꾸면 (.env가 바뀌면) 봇이 다시 켜지지 않아도 새 키로 연결한다."""
+        stamps = iter([1, 2])
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        with mock.patch.object(stockbot, "env_stamp", lambda: next(stamps)), \
+                mock.patch.object(toss, "load_credentials", lambda: ("id", "secret", "1")):
+            bot = self.make_bot("live")
+            bot.step(at(DAY1, "08:30"))                                  # 처음: 지금 .env만 기억한다
+            self.assertIs(bot.client, self.toss)
+            self.client = FakeToss()                                     # 새 키로 만든 연결
+            self.client.set(self.SYMBOL, DAY1, 100_000)
+            bot.step(at(DAY1, "08:31"))
+        self.assertIs(bot.client, self.client)
+        self.assertIs(bot.executor.client, self.client)                  # 실거래 주문도 새 키로
+
     def test_no_keys_waits_without_crashing(self):
         self.client = None
         bot = self.make_bot()
@@ -301,7 +320,7 @@ class StockBotTest(TempDb):
         self.request(4, action="close", slot=sid)
         bot.step(at(DAY1, "15:40"))                                      # 장 마감 뒤: 표시만 해 두고
         self.assertTrue(self.slot(bot)["closing"])
-        self.assertIn("다음 장 시작(09:00)에 팔고 빼요", self.db.get_state("status")["slots"][0]["state_text"])
+        self.assertIn("다음 거래 시작(09:00)에 팔고 빼요", self.db.get_state("status")["slots"][0]["state_text"])
         self.request(5, action="cancel_close", slot=sid)                 # 취소하면 다시 전략대로
         bot.step(at(DAY1, "15:41"))
         self.assertNotIn("closing", self.slot(bot))
@@ -336,39 +355,93 @@ class StockBotTest(TempDb):
         status = self.db.get_state("status")
         self.assertEqual(len(status["slots"]), 2)
 
-    def test_nxt_stock_is_judged_on_regular_session_bars(self):
-        prev = [candle("2026-10-21", 100_000, 120_000, 80_000, 110_000),   # NXT 종목 일봉 = 08:00~20:00 전체
-                candle("2025-02-28", 50_000, 51_000, 49_000, 50_500)]       # NXT가 생기기 전: 일봉 = 정규장
+    def test_nxt_stock_trades_from_pre_market_on_full_day_bars(self):
+        """넥스트레이드 종목은 08:00 프리마켓부터 사고판다. 판단·순위도 08:00~20:00 통합 일봉 그대로."""
+        prev = [candle("2026-10-21", 100_000, 120_000, 80_000, 110_000)]  # NXT 종목 일봉 = 08:00~20:00 전체
         self.toss.set(self.SYMBOL, DAY1, 100_000, prev=prev)
         self.toss.nxt.add(self.SYMBOL)
-        regular = candle("2026-10-21", 101_000, 105_000, 99_000, 104_000)   # 09:01~15:30 1분봉으로 만든 정규장 일봉
-        self.toss.regular_[(self.SYMBOL, "2026-10-21")] = regular
         bot = self.make_bot()
         self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000)
-        bot.step(at(DAY1, "08:30"))
-        bot.step(at(DAY1, "09:01"))
-        rows = self.db.candle_history(self.SYMBOL, 10, stockbot.REGULAR_TF)
-        ohlc = lambda c: (c["day"], c["open"], c["high"], c["low"], c["close"])
-        self.assertEqual([ohlc(r) for r in rows], [ohlc(prev[1]), ohlc(regular)])
-        self.assertEqual(self.toss.regular_calls, [(self.SYMBOL, "2026-10-21")])  # 1분봉은 NXT 뒤 날짜만, 한 번
-        bot.step(at(DAY1, "09:02"))
+        bot.step(at(DAY1, "07:50"))                                      # 프리마켓 전: 계좌만
+        self.assertEqual(self.trades(), [])
+        bot.step(at(DAY1, "08:01"))                                      # 프리마켓: 계획을 세우고 바로 산다
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        self.assertIn("프리마켓", self.db.recent_trades()[0]["reason"])
+        rows = self.db.candle_history(self.SYMBOL, 10, stockbot.DAY_TF)
+        self.assertEqual((rows[-1]["high"], rows[-1]["low"]), (120_000, 80_000))  # 일봉을 그대로 쓴다
         x = self.db.get_state("status")["slots"][0]
-        self.assertAlmostEqual(x["change_rate"], (100_000 / 104_000 - 1) * 100)  # 등락률도 전날 정규장 종가 기준
-        self.assertEqual(self.db.get_state("rankings")[self.SYMBOL]["bars"], stockbot.REGULAR_TF)
+        self.assertEqual((x["venue"]["label"], x["venue"]["hours"]), ("KRX·NXT", "08:00~20:00"))
+        self.assertIn("프리마켓", self.db.get_state("status")["session_text"])
+        bot.step(at(DAY1, "09:02"))
+        self.assertEqual(self.db.get_state("rankings")[self.SYMBOL]["bars"], stockbot.DAY_TF)
+        self.assertEqual(len(self.trades()), 1)                          # 하루 첫 거래 때 한 번만
 
-    def test_regular_bars_are_built_a_few_days_at_a_time(self):
-        days = [f"2026-10-{d:02d}" for d in range(1, 21)]
-        self.toss.candles_[self.SYMBOL] = [candle(d, 100, 110, 90, 105) for d in reversed(days)]
+    def test_stop_loss_also_works_in_after_market(self):
+        """정규장이 끝나도 손 놓고 있지 않는다: 애프터마켓에서도 손절선을 지킨다 (15:30~15:40 단일가 시간은 빼고)."""
         self.toss.nxt.add(self.SYMBOL)
-        self.db.upsert_candles(self.SYMBOL, self.toss.candles_[self.SYMBOL])
-        done = stockbot.sync_regular(self.db, self.toss, self.SYMBOL, True, DAY1, budget=8)
-        self.assertFalse(done)                                           # 한 번에 8일만
-        self.assertFalse(stockbot.regular_ready(self.db, self.SYMBOL))
-        self.assertEqual(self.toss.regular_calls[0], (self.SYMBOL, "2026-10-20"))  # 최근 날부터
-        stockbot.sync_regular(self.db, self.toss, self.SYMBOL, True, DAY1, budget=8)
-        self.assertTrue(stockbot.sync_regular(self.db, self.toss, self.SYMBOL, True, DAY1, budget=8))
-        self.assertTrue(stockbot.regular_ready(self.db, self.SYMBOL))
-        self.assertEqual(len(self.toss.regular_calls), 20)
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot()
+        self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000,
+                     stop_loss=10)
+        bot.step(at(DAY1, "07:50"))                                      # 계좌 만들기
+        bot.step(at(DAY1, "08:01"))
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000                 # 장 끝난 뒤 손절선(약 90,000원) 아래로
+        bot.step(at(DAY1, "15:35"))
+        self.assertEqual(len(self.trades()), 1)
+        bot.step(at(DAY1, "17:00"))
+        self.assertEqual([t[0] for t in self.trades()], ["buy", "sell"])
+        self.assertIn("애프터마켓", self.db.recent_trades()[0]["reason"])
+        self.assertIn("애프터마켓", self.db.get_state("status")["session_text"])
+
+    def test_trading_hours_by_stock_kind(self):
+        bot = self.make_bot()
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        self.toss.types[self.SYMBOL] = "ETF"                            # ETF: 넥스트레이드에도 KRX 애프터마켓에도 없다
+        self.request(1, action="add", symbol=self.SYMBOL, name="ETF", strategy="buy_and_hold", amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        self.assertEqual(self.trades(), [])
+        bot.step(at(DAY1, "09:01"))
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        bot.step(at(DAY1, "17:00"))
+        self.assertEqual(len(self.trades()), 1)
+        x = self.db.get_state("status")["slots"][0]
+        self.assertEqual((x["venue"]["label"], x["venue"]["hours"]), ("KRX", "09:00~15:30"))
+        slot = next(iter(bot.slots))
+        window = lambda day, hhmm: bot._window(slot, krx.session(at(day, hhmm)), at(day, hhmm), day)
+        self.assertIsNone(window(DAY2, "08:10"))
+        self.toss.types[self.SYMBOL] = "STOCK"                          # 보통 주식: KRX 애프터마켓 16시부터, 프리마켓은 없다
+        bot.db.delete_state("nxt_symbols")
+        bot._market_info(self.SYMBOL, DAY1)
+        self.assertEqual([window(DAY1, t) for t in ("08:10", "09:30", "15:25", "15:50", "16:10", "20:00")],
+                         [None, "regular", None, None, "after", None])
+        self.assertEqual(bot.venue(self.SYMBOL, DAY1)["hours"], "09:00~20:00")
+        self.toss.nxt.add(self.SYMBOL)                                   # 넥스트레이드 종목: 08:00~08:50, 15:40~20:00
+        bot.db.delete_state("nxt_symbols")
+        bot._market_info(self.SYMBOL, DAY1)
+        self.assertEqual([window(DAY1, t) for t in ("07:59", "08:10", "08:55", "15:45", "19:59", "20:00")],
+                         [None, "pre", None, "after", "after", None])
+
+    def test_after_market_rejection_waits_instead_of_erroring(self):
+        self.toss.nxt.add(self.SYMBOL)
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        self.toss.cash_ = 350_000
+        bot = self.make_bot("live")
+        self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000,
+                     stop_loss=10)
+        bot.step(at(DAY1, "08:01"))
+        bot.step(at(DAY1, "08:02"))
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        with mock.patch.object(self.toss, "place_order",
+                               side_effect=toss.OrderRejected("주문 불가 시간", status=422, code="order-hours-closed")):
+            bot.step(at(DAY1, "17:00"))                                  # 오류로 멈추지 않고 10분 뒤에 다시
+        self.assertEqual(len(self.trades()), 1)
+        self.assertIn(self.SYMBOL, bot.ext_blocked)
+        bot.ext_blocked.clear()
+        bot.step(at(DAY1, "17:10"))
+        self.assertEqual([t[0] for t in self.trades()], ["buy", "sell"])
 
     def test_key_expiry_is_alerted_with_renewal_steps(self):
         bot = self.make_bot()
@@ -412,6 +485,55 @@ class StockBotTest(TempDb):
         self.request(3, action="strategy", slot=sid, strategy="buy_and_hold", stop_loss=0.2)
         bot.step(at(DAY2, "09:04"))
         self.assertFalse(self.results()[-1][0])                          # 너무 작은 손절선은 받지 않는다
+
+    def test_orders_use_the_book_at_that_moment_and_keep_the_planned_price(self):
+        """주문은 그 순간의 호가로 (살 때 가장 싼 매도 호가, 팔 때 가장 비싼 매수 호가). 계획 가격과 함께 적어서 체결 오차를 본다."""
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        book = {"ask": 100_100, "bid": 99_900}                           # 10만 원대 호가 한 칸 = 100원
+        self.toss.best_prices = lambda symbol: (book["ask"], book["bid"])
+        bot = self.make_bot()
+        self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000,
+                     stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        bot.step(at(DAY1, "09:01"))
+        t = self.db.recent_trades()[0]
+        self.assertEqual((t["side"], t["price"], t["ref"]), ("buy", 100_100, 100_000))  # 한 칸 비싸게, 계획은 시가
+        self.toss.quotes_[self.SYMBOL]["price"] = 85_000                 # 폭락: 손절선 아래
+        book.update(ask=85_500, bid=84_000)                              # 다시 낼 때는 그때 호가로
+        bot.step(at(DAY1, "10:00"))
+        t = self.db.recent_trades()[0]
+        self.assertEqual((t["side"], t["price"]), ("sell", 84_000))
+        summary = stockbot.slippage_summary(self.db, "paper")
+        self.assertEqual((summary["buy"]["n"], round(summary["buy"]["ticks"], 2)), (1, 1.0))   # 100원 = 한 칸
+        self.assertGreater(summary["sell"]["pct"], 0)                    # 계획(손절선)보다 싸게 팔렸다
+
+    def test_open_buy_retries_with_fresh_quotes_and_does_not_chase(self):
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        book = {"ask": 101_500, "bid": 99_500}                           # 시가보다 1% 넘게 비싸다: 쫓아 사지 않는다
+        self.toss.best_prices = lambda symbol: (book["ask"], book["bid"])
+        bot = self.make_bot()
+        self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000)
+        now = [1_000.0]
+        with mock.patch.object(stockbot, "clock", lambda: now[0]):
+            bot.step(at(DAY1, "08:30"))
+            bot.step(at(DAY1, "09:01"))
+            self.assertEqual(self.trades(), [])
+            book["ask"] = 100_500                                        # 다음 루프: 그때 호가가 내려왔다 → 산다
+            now[0] += 20
+            bot.step(at(DAY1, "09:02"))
+            self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        self.toss.set(self.SYMBOL, DAY2, 100_000)
+        book["ask"] = 103_000
+        sid = next(iter(bot.book.data["slots"]))
+        bot.book.slot(sid).update(qty=0, cost=0.0)                       # 다음 날 다시 살 차례라고 치고
+        now = [5_000.0]
+        with mock.patch.object(stockbot, "clock", lambda: now[0]):
+            bot.step(at(DAY2, "09:01"))
+            now[0] += stockbot.OPEN_RETRY_SEC + 1                        # 5분 동안 계속 비싸면 오늘은 접는다
+            bot.step(at(DAY2, "09:07"))
+        self.assertEqual(len(self.trades()), 1)
+        self.assertEqual(bot._sstate(next(iter(bot.slots))).get("open_done_day"), DAY2)
+        self.assertTrue(any("건너뛰어요" in e["message"] for e in self.db.recent_events()))
 
     def test_sold_account_is_not_bought_back_at_the_same_open(self):
         self.toss.set(self.SYMBOL, DAY1, 100_000)
@@ -457,6 +579,24 @@ class StockBotTest(TempDb):
         self.assertAlmostEqual(x["hold_return_pct"], 10.0)
         self.assertAlmostEqual(x["hold_pnl"], 35_000)
         self.assertAlmostEqual(x["return_pct"], 0.0)                    # RSI는 아직 안 샀다
+
+    def test_last_judgment_is_shown_outside_market_hours(self):
+        """장 밖에서 켜져도 마지막 장의 판단을 다시 세워 계좌 카드 색에 쓴다 (매매는 장 시작 계획으로)."""
+        self.toss.set(self.SYMBOL, DAY1, 100_000, prev=[candle("2026-10-21", 100, 110, 90, 100),
+                                                        candle("2026-10-20", 100, 110, 90, 100)])
+        bot = self.make_bot()
+        self.request(1, action="add", symbol=self.SYMBOL, name="SK하이닉스", strategy="buy_and_hold", amount=350_000)
+        bot.step(at(DAY1, "08:30"))
+        bot.step(at(DAY1, "09:01"))                                      # 장 시작: 계획을 세우고 산다
+        self.assertEqual(self.db.get_state("status")["slots"][0]["judged"]["day"], DAY1)
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])
+        bot = self.make_bot()                                            # 그날 거래가 다 끝난 뒤 봇이 다시 켜짐 (계획이 없다)
+        bot.step(at(DAY1, "20:30"))
+        x = self.db.get_state("status")["slots"][0]
+        self.assertIsNone(x["plan"])
+        self.assertEqual(x["judged"]["day"], DAY1)                       # 오늘 아침 판단을 다시 세웠다
+        self.assertTrue(x["judged"]["buy_at_open"])                      # 그냥 들고 있기: 사자
+        self.assertEqual(self.trades(), [("buy", self.SYMBOL, 3)])       # 매매는 하지 않는다
 
     def test_holiday_is_detected_when_no_trading_shows_up(self):
         self.toss.set(self.SYMBOL, DAY1, 100_000)
@@ -665,6 +805,8 @@ class StockWebTest(TempDb):
                                                            {"symbol": "000660", "name": "SK하이닉스", "market": "KOSPI"}]})
         self.assertEqual([s["symbol"] for s in web.stock_search(self.stock_path, "삼성전자")], ["005930", "005935"])
         self.assertEqual([s["symbol"] for s in web.stock_search(self.stock_path, "하이닉")], ["000660"])
+        target, _ = web._search_target(self.main_path, self.stock_path, DEFAULTS, "stock", "000660", "1d", 3)
+        self.assertEqual(target["name"], "SK하이닉스")                     # 계좌에 없는 종목도 조합 찾기에서 이름이 나온다
         payload = web.build_stock_payload(self.stock_path, self.main_path)
         self.assertTrue(payload["pin_set"])
         self.assertTrue(any(s["stock_only"] for s in payload["strategies"]))
@@ -673,10 +815,8 @@ class StockWebTest(TempDb):
         start = datetime(2024, 1, 1)
         rows = [candle((start + timedelta(days=i)).strftime("%Y-%m-%d"), 100 + i % 7, 104 + i % 7, 97 + i % 7, 101 + i % 7)
                 for i in range(600)]
+        self.assertTrue(web.build_stock_simulation(self.stock_path, cfg, "005930", 365, "disparity")["need_data"])  # 일봉이 아직 없으면 기다린다
         self.db.upsert_candles("005930", rows)
-        sim = web.build_stock_simulation(self.stock_path, cfg, "005930", 365, "disparity")
-        self.assertTrue(sim["need_data"])                                # 정규장 일봉이 아직 없으면 기다린다
-        self.db.upsert_candles("005930", rows, stockbot.REGULAR_TF)
         sim = web.build_stock_simulation(self.stock_path, cfg, "005930", 365, "disparity")
         self.assertTrue(sim["ready"])
         self.assertEqual((sim["detail"]["name"], len(sim["detail"]["close"])), ("disparity", 365 * 250 // 365))

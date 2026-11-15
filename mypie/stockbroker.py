@@ -1,13 +1,14 @@
 """주식 주문 실행.
 
-  - PaperStockExecutor: 모의투자. 지금 가격에 바로 체결됐다고 보고 수수료·세금만 뗀다.
+  - PaperStockExecutor: 모의투자. 정해 준 지정가(그 순간의 호가)에 바로 체결됐다고 보고 수수료·세금만 뗀다.
   - LiveStockExecutor: 토스증권 실거래. 주문마다 우리가 만든 번호(client_id)를 붙이고, 주문 직전에
     '진행 중인 주문'으로 DB에 적어 둔다. 정전·통신 끊김으로 결과를 모르게 되면 recover()가
     토스증권에 물어서 체결됐으면 장부에 반영하게 하고, 안 들어갔으면 지운다.
 
-실거래 주문은 시장가 대신 '지금 가격 ±1%' 지정가로 낸다. 바로 체결되고(가장 좋은 호가에 체결), 국내 시장가 매수가
-상한가 기준으로 돈을 묶어서 살 수 있는 수량이 줄어드는 문제도 없다. 정해진 시간 안에 다 체결되지 않으면
-남은 수량은 취소하고 체결된 만큼만 장부에 적는다.
+주문은 시장가 대신 지정가로 낸다. 값은 주식 봇이 그 순간의 호가로 정해 준다 (살 때는 가장 싼 매도 호가, 팔 때는 가장
+비싼 매수 호가: 바로 체결되는 값). 국내 시장가 매수가 상한가 기준으로 돈을 묶어서 살 수 있는 수량이 줄어드는 문제도 없다.
+정해진 시간 안에 다 체결되지 않으면 남은 수량은 취소하고 체결된 만큼만 장부에 적는다. 남은 건 주식 봇이 다음 루프에
+그때의 호가로 다시 낸다 (폭등·폭락 때 처음 값에 묶여 있지 않게).
 """
 
 import time
@@ -17,8 +18,7 @@ from . import krx, toss
 from .db import Database
 from .timeutil import ts
 
-SLIPPAGE = 0.01       # 지정가를 지금 가격에서 얼마나 불리하게 잡을지 (바로 체결되게)
-FILL_WAIT_SEC = 20    # 이 시간 안에 다 안 되면 남은 수량을 취소한다
+FILL_WAIT_SEC = 10    # 이 시간 안에 다 안 되면 남은 수량을 취소한다 (다음 루프에 그때 호가로 다시)
 FINAL = ("filled", "cancelled", "rejected")
 
 
@@ -28,17 +28,17 @@ class PaperStockExecutor:
     def __init__(self, fee_rate: float, sell_tax: float):
         self.fee_rate, self.sell_tax = fee_rate, sell_tax
 
-    def buy(self, symbol: str, cash: float, price: float, note: dict) -> tuple[int, float, float] | None:
+    def buy(self, symbol: str, cash: float, limit: float, note: dict) -> tuple[int, float, float] | None:
         """(주수, 체결가, 수수료). 1주도 못 사면 None."""
-        qty = int(cash // (price * (1 + self.fee_rate)))
+        qty = int(cash // (limit * (1 + self.fee_rate)))
         if qty < 1:
             return None
-        return qty, price, qty * price * self.fee_rate
+        return qty, limit, qty * limit * self.fee_rate
 
-    def sell(self, symbol: str, qty: int, price: float, note: dict) -> tuple[int, float, float, float]:
+    def sell(self, symbol: str, qty: int, limit: float, note: dict) -> tuple[int, float, float, float]:
         """(주수, 체결가, 수수료, 세금)."""
-        value = qty * price
-        return qty, price, value * self.fee_rate, value * self.sell_tax
+        value = qty * limit
+        return qty, limit, value * self.fee_rate, value * self.sell_tax
 
     def recover(self):
         return None
@@ -57,17 +57,16 @@ class LiveStockExecutor:
         self.fee_rate, self.sell_tax = fee_rate, sell_tax
         self.wait_sec, self.sleep = wait_sec, sleep
 
-    def buy(self, symbol: str, cash: float, price: float, note: dict) -> tuple[int, float, float] | None:
-        limit = krx.round_tick(price * (1 + SLIPPAGE), up=True)
+    def buy(self, symbol: str, cash: float, limit: float, note: dict) -> tuple[int, float, float] | None:
+        limit = int(limit)
         qty = int(cash // (limit * (1 + self.fee_rate)))
         if qty < 1:
             return None
         fill = self._place(symbol, "buy", qty, limit, note)
         return fill["qty"], fill["price"], fill["fee"]
 
-    def sell(self, symbol: str, qty: int, price: float, note: dict) -> tuple[int, float, float, float]:
-        limit = max(krx.round_tick(price * (1 - SLIPPAGE), up=False), 1)
-        fill = self._place(symbol, "sell", qty, limit, note)
+    def sell(self, symbol: str, qty: int, limit: float, note: dict) -> tuple[int, float, float, float]:
+        fill = self._place(symbol, "sell", qty, max(int(limit), 1), note)
         return fill["qty"], fill["price"], fill["fee"], fill["tax"]
 
     def _place(self, symbol: str, side: str, qty: int, limit: int, note: dict) -> dict:

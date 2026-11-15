@@ -21,13 +21,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from mypie import (auth, backtest, indicators, keys, krx, network, pin, reports, simjob, simulation, sshwatch, stoploss,
-                   telegram, timeframes, upbit, web)
+from mypie import (alerts, auth, backtest, combosearch, curve, indicators, keys, krx, network, pin, reports, simjob, simulation,
+                   sshwatch, stoploss,
+                   telegram, timeframes, toss, upbit, web)
 from mypie.bot import Bot, check_account
 from mypie.broker import Book, LiveExecutor, PaperExecutor, migrate_book
 from mypie.config import DEFAULTS
 from mypie.db import Database
-from mypie.strategies import STRATEGIES, create_strategy, strategy_params
+from mypie.strategies import STOCK_STRATEGIES, STRATEGIES, create_strategy, strategy_params
 from mypie.strategies.base import DayPlan, Strategy, render_text
 from mypie.strategies.combo import check_rule, make_rule, normalize_rule, rule_fields
 from mypie.timeutil import KST, trading_day
@@ -400,6 +401,18 @@ class ComboRuleTest(unittest.TestCase):
         plan = make_rule(rule, lambda n: STRATEGIES[n](None)).plan(flat_history(10), 100.0)  # 둘 다 봉이 모자람
         self.assertFalse(plan.sell_at_open)
         self.assertIn("데이터 부족", plan.note)
+        self.assertEqual(plan.signals, {"rsi": None, "ma_cross": None, "macd": None})  # 화면에 색을 칠하지 않는다
+
+    def test_combo_tells_what_each_strategy_says_now(self):
+        """계좌 카드 색: 전략마다 혼자였다면 지금 들고 있을지 (사자 True · 팔자 False)."""
+        rule = normalize_rule({"strategy": "ma_cross", "sell": ["ma_cross", "buy_and_hold"], "sell_op": "or"})
+        prices = [100 + 10 * math.sin(i / 6) for i in range(200)]
+        history = [candle(f"d{i:03d}", p, p * 1.01, p * 0.99, p) for i, p in enumerate(prices)]
+        for cut in (180, 190):  # 골든크로스가 위·아래인 두 때
+            plan = make_rule(rule, lambda n: STRATEGIES[n](None)).plan(history[:cut], prices[cut])
+            alone = STRATEGIES["ma_cross"](None).plan(history[:cut], prices[cut])
+            self.assertEqual(plan.signals, {"ma_cross": alone.buy_at_open, "buy_and_hold": True})
+        self.assertIsNone(STRATEGIES["ma_cross"](None).plan(history, prices[-1]).signals)  # 전략 하나는 화면이 계획으로 정한다
 
 
 class TempDbTest(unittest.TestCase):
@@ -914,6 +927,24 @@ class BotFlowTest(TempDbTest):
         self.go(bot, self.D1)                                          # 계좌 원화가 업비트 원화 전부면 0.5% 남기고 산다
         self.assertEqual(self.client.orders[0]["price"], str(math.floor(100_000 * 0.995 / 1.0005)))
 
+    def test_telegram_buttons(self):
+        bot = self.make_bot()
+        calls, edits = [], []
+        query = lambda data, chat="1": {"id": "q", "data": data, "message": {"message_id": 7, "chat": {"id": chat}, "text": "12 (192.168.0.5)"}}
+        with mock.patch.object(telegram, "call", lambda token, method, params=None, **kw: calls.append((method, params))), \
+                mock.patch.object(telegram, "edit", lambda mid, text, creds, buttons=None: edits.append((mid, text, buttons))):
+            ask = auth.open_ask(self.db, "192.168.0.5")
+            bot._on_button(query(f"login:yes:{ask}", chat="999"), ("t", "1"), self.db)   # 남의 채팅에서 누른 건 무시
+            self.assertEqual(auth.take_ask(self.db, ask, "192.168.0.5"), "wait")
+            bot._on_button(query(f"login:yes:{ask}"), ("t", "1"), self.db)
+            self.assertEqual(auth.take_ask(self.db, ask, "192.168.0.5"), "yes")
+            self.assertEqual(edits[-1][:2], (7, "12 (192.168.0.5)\n✅ 들여보냈어요"))   # 버튼은 지운다
+            self.assertIsNone(edits[-1][2])
+            bot._on_button(query("view:signal"), ("t", "1"), self.db)
+            self.assertIn("전략 신호", edits[-1][1])
+            self.assertEqual(edits[-1][2][1], ("🔄 새로고침", "view:signal"))
+        self.assertTrue(all(m == "answerCallbackQuery" for m, _ in calls))   # 누를 때마다 버튼의 '도는 중'을 끝낸다
+
     def test_warns_when_public_ip_changes(self):
         self.accounts(("a", "KRW-BTC", "rsi", 100_000), mode="live")
         bot = self.make_bot()
@@ -980,6 +1011,61 @@ class WebTest(TempDbTest):
         self.assertEqual(web.request_coin(self.path, {**self.request, "pin": "5678"})[0], 200)
         self.assertFalse(web.build_payload(self.path)["pin_default"])
         self.assertTrue(pin.is_default(pin.make("0000")))                      # 0000으로 다시 정해도 '기본'으로 알려 준다
+
+    def test_exchange_keys_are_checked_then_saved_only_from_home(self):
+        """⚙️ 설정의 키 넣기: 집 와이파이 + PIN, 연결해 보고 되면 저장. 키는 응답에 다시 넣지 않는다."""
+        saved = []
+
+        class FakeUpbit:
+            def __init__(self, access, secret):
+                self.ok = secret != "wrongsecret"
+
+            def accounts(self):
+                if not self.ok:
+                    raise UpbitError("invalid_access_key")
+                return [{"currency": "KRW", "balance": "120000", "locked": "0"}, {"currency": "BTC", "balance": "0.1", "locked": "0"}]
+
+            def key_expiry(self):
+                return "2027-10-29T00:00:00+09:00"
+
+        good = {"broker": "upbit", "access": "A" * 40, "secret": "S" * 40, "pin": "2468"}
+        with mock.patch.object(web.upbit, "UpbitClient", FakeUpbit), \
+                mock.patch.object(web, "save_keys", lambda a, s: saved.append((a, s))):
+            self.assertEqual(web.save_broker_keys(self.path, good, "211.235.10.20")[0], 403)        # 집 밖 (휴대폰 통신사 IP)
+            self.assertEqual(web.save_broker_keys(self.path, {**good, "pin": "1111"}, "192.168.0.5")[0], 403)
+            self.assertEqual(web.save_broker_keys(self.path, {**good, "secret": "S" * 20 + "\nX=1"}, "192.168.0.5")[0], 400)
+            self.assertEqual(web.save_broker_keys(self.path, {**good, "secret": "wrongsecret"}, "192.168.0.5")[0], 400)
+            self.assertEqual(saved, [])                                                             # 안 되는 키는 저장하지 않는다
+            code, body = web.save_broker_keys(self.path, good, "192.168.0.5")
+        self.assertEqual(code, 200)
+        self.assertEqual(saved, [("A" * 40, "S" * 40)])
+        self.assertIn("120,000원", body["message"])
+        self.assertIn("2027-10-29", body["message"])
+        self.assertNotIn("S" * 40, json.dumps(body))
+
+    def test_toss_keys_ask_which_account_when_there_are_many(self):
+        written = []
+
+        class FakeToss:
+            def __init__(self, client_id, secret):
+                self.account = None
+
+            def accounts(self):
+                return [{"accountSeq": 1, "accountNo": "11112222", "accountType": "BROKERAGE"},
+                        {"accountSeq": 2, "accountNo": "33334444", "accountType": "BROKERAGE"}]
+
+            def cash(self):
+                return 500_000.0 if self.account == "2" else 0.0
+
+        data = {"broker": "toss", "client_id": "C" * 30, "secret": "T" * 30, "pin": "2468"}
+        with mock.patch.object(web.toss, "TossClient", FakeToss), mock.patch.object(web, "write_env", written.append):
+            code, body = web.save_broker_keys(self.path, data, "127.0.0.1")
+            self.assertEqual((code, body["ok"], [c["label"] for c in body["choose"]]), (200, False, ["계좌 ****2222", "계좌 ****4444"]))
+            self.assertEqual(written, [])
+            code, body = web.save_broker_keys(self.path, {**data, "account": "2"}, "127.0.0.1")
+        self.assertEqual((code, body["ok"]), (200, True))
+        self.assertIn("500,000원", body["message"])
+        self.assertEqual(written, [{toss.CLIENT_ID: "C" * 30, toss.CLIENT_SECRET: "T" * 30, toss.ACCOUNT: "2"}])
 
     def test_locks_after_too_many_failures(self):
         for _ in range(web.MAX_PIN_FAILURES):
@@ -1094,8 +1180,8 @@ class WebTest(TempDbTest):
         self.assertEqual((sim["days"], sim["detail"]["name"], len(sim["detail"]["close"])), (90, "rsi", 90))
         self.assertEqual(len(sim["results"]), len(STRATEGIES))
         self.assertNotIn("detail", sim["results"][0])
-        self.assertEqual([p["ok"] for p in sim["periods"]], [True, True, True, False, True])  # 1년은 봉이 모자람
-        self.assertEqual([p["long"] for p in sim["periods"]], [False, False, False, False, True])  # 3년은 따로 계산 (봉은 그때 받는다)
+        self.assertEqual([p["ok"] for p in sim["periods"]], [True, True, True, False, True, True, True])  # 1년은 봉이 모자람
+        self.assertEqual([p["long"] for p in sim["periods"]], [False, False, False, False, True, True, True])  # 3·5·8년은 따로 계산 (봉은 그때 받는다)
         self.assertTrue(sim["stale"])                                   # 마지막 봉이 오래전
         self.assertEqual(web.build_simulation(self.path, cfg, "KRW-ETH", "1d", 365, "")["days"], 180)  # 되는 기간 중 가장 긴 것
         long = web.build_simulation(self.path, cfg, "KRW-ETH", "1d", 1095, "")
@@ -1151,6 +1237,67 @@ class LongSimulationTest(TempDbTest):
                 "bars": 1095, "rule": rule, "stop_loss": stop, "base_key": base, "combo_key": combo, "label": "ETH 3년",
                 "workers": 2}  # 리눅스(파이)에서는 CPU 둘에 나눠서, 윈도에서는 한 프로세스에서
 
+    def test_combo_search_matches_the_simulation_and_keeps_history(self):
+        """좋은 조합 찾기: 전략·쪽마다 한 번만 계산해도 진짜 시뮬레이션(make_rule + simulate)과 결과가 같다.
+        결과는 최근 것부터 쌓이고, 오래 걸린 건 텔레그램 요약도 만든다."""
+        candles = self.db.candle_history("KRW-ETH", 1300, "1d")
+        ctx = simulation.context("coin", self.cfg, "1d", 5.0)
+        out = combosearch.search(candles, 900, ctx)
+        self.assertEqual(out["count"], 36 * 36)                               # 상위 6개를 한쪽에 하나·둘(그리고·또는)로
+        same = [(round(r["total_return"], 9), round(r["mdd"], 9), r["trades"]) for r in out["results"]]
+        self.assertEqual(len(same), len(set(same)))                           # 결과가 똑같은 조합은 하나만 (나머지는 개수로)
+        make = lambda n: create_strategy(n, ctx["params"][n])
+        for r in out["results"][:3] + out["results"][-2:] + [{"rule": normalize_rule({"strategy": out["top"][0]}), **out["singles"][0]}]:
+            real = backtest.simulate(make_rule(r["rule"], make), candles, ctx["fee"], len(candles) - 900, stop_loss=5.0)
+            self.assertAlmostEqual(real["total_return"], r["total_return"], places=4)
+            self.assertAlmostEqual(real["mdd"], r["mdd"], places=4)
+            self.assertEqual(real["trades"], r["trades"])
+        stock = simulation.context("stock", self.cfg, "1d", 0.0, "STOCK")         # 주식: 매매마다 호가 한 칸 불리하게
+        found = combosearch.search(candles, 900, stock)
+        smake = lambda n: create_strategy(n, stock["params"][n], STOCK_STRATEGIES)
+        for r in found["results"][:2]:
+            real = backtest.simulate(make_rule(r["rule"], smake), candles, stock["fee"], len(candles) - 900,
+                                     sell_cost=stock["sell_cost"], tick=stock["tick"])
+            self.assertAlmostEqual(real["total_return"], r["total_return"], places=4)
+            self.assertEqual(real["trades"], r["trades"])
+        plain = backtest.simulate(make_rule(found["results"][0]["rule"], smake), candles, stock["fee"], len(candles) - 900,
+                                  sell_cost=stock["sell_cost"])
+        if found["results"][0]["trades"]:
+            self.assertLess(found["results"][0]["total_return"], plain["total_return"])  # 한 칸씩 손해 본 만큼 낮다
+        self.assertEqual((krx.tick_size(27_315), krx.tick_size(27_315, etf=True)), (50, 5))  # ETF는 호가 단위가 따로
+        spec = {"task": "search", "id": "search-coin-KRW-ETH-1d-3-", "kind": "coin", "db": self.path, "market": "KRW-ETH",
+                "name": "이더리움", "tf": "1d", "tf_label": "일봉", "years": 3, "bars": 1095, "label": "🔍", "workers": 1}
+        with mock.patch.object(simjob, "_fetch"), mock.patch.object(combosearch, "RECENT", 2):
+            for n in (1, 2, 3):
+                self.assertEqual(simjob.run({**spec, "id": f"{spec['id']}{n}"}, self.folder, self.cfg), "done")
+        page = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})
+        self.assertEqual([h["id"] for h in page["history"]], [spec["id"] + "3", spec["id"] + "2"])  # 최근 것부터, 정한 개수까지
+        self.assertEqual((page["result"]["id"], page["result"]["bars"]), (spec["id"] + "3", 1095))
+        self.assertIn("좋은 조합 찾기 끝 · 이더리움 일봉 3년", combosearch.telegram_text(page["result"]))
+        older = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"], "id": [spec["id"] + "2"]})
+        self.assertEqual(older["result"]["id"], spec["id"] + "2")
+        save = lambda action, n: web.search_request(self.path, "/no/such.db", self.cfg, {"action": action, "kind": "coin", "id": spec["id"] + n})
+        self.assertEqual(save("save", "2")[0], 200)                            # ⭐ 저장한 건 최근 몇 개에서 밀려나도 남는다
+        with mock.patch.object(simjob, "_fetch"), mock.patch.object(combosearch, "RECENT", 2):
+            for n in ("4", "5"):
+                simjob.run({**spec, "id": spec["id"] + n}, self.folder, self.cfg)
+        page = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})
+        self.assertEqual([(h["id"][-1], bool(h["saved"])) for h in page["history"]], [("5", False), ("4", False), ("2", True)])
+        self.assertEqual(save("unsave", "2")[0], 200)
+        self.assertEqual(save("save", "nope")[0], 404)
+        short = {**spec, "id": spec["id"] + "s", "bars": 5000}                 # 데이터가 모자라면 있는 만큼으로
+        with mock.patch.object(simjob, "_fetch"):
+            self.assertEqual(simjob.run(short, self.folder, self.cfg), "done")
+        r = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})["result"]
+        self.assertTrue(r["short"])
+        self.assertEqual(r["bars"], 1300 - backtest.WARMUP)
+        ask = lambda **d: web.search_request(self.path, "/no/such.db", self.cfg, {"action": "start", "kind": "coin", **d})[0]
+        self.assertEqual(ask(market="KRW-ETH", tf="15m", years=8), 400)       # 15분봉은 2년까지
+        self.assertEqual(ask(market="KRW-ETH", tf="1d", years=4), 400)        # 고를 수 있는 기간만
+        est = web.build_search(self.path, "/no/such.db", self.cfg,
+                               {"kind": ["coin"], "only": ["estimate"], "market": ["KRW-ETH"], "tf": ["1d"], "years": ["3"]})
+        self.assertGreater(est["estimate"]["sec"], 0)
+
     def test_job_computes_once_and_page_reads_the_saved_result(self):
         with mock.patch.object(upbit, "get_candles", return_value=[]):
             self.assertEqual(simjob.run(self.spec(), self.folder, self.cfg), "done")
@@ -1187,10 +1334,17 @@ class LongSimulationTest(TempDbTest):
         with mock.patch.object(upbit, "get_candles", return_value=[]):
             self.assertEqual(simjob.run(self.spec(), self.folder, self.cfg), "stopped")
         self.assertFalse((self.folder / simjob.STOP).exists())
-        spec = {**self.spec(), "days": 3650, "bars": 3650}               # 상장 이후 봉이 모자라면 알려 준다
+        spec = {**self.spec(), "days": 3650, "bars": 3650}               # 상장 이후 봉이 모자라면 있는 만큼으로
         with mock.patch.object(upbit, "get_candles", return_value=[]):
-            self.assertEqual(simjob.run(spec, self.folder, self.cfg), "error")
-        self.assertIn("1300봉뿐", simjob.read_state(self.folder)["message"])
+            self.assertEqual(simjob.run(spec, self.folder, self.cfg), "done")
+        base = simulation.load(self.folder / f"{spec['base_key']}.json")
+        self.assertEqual((base["bars"], base["short"]), (1300 - backtest.WARMUP, True))
+        sim = simulation.assemble({}, base, None, "rsi", "return", 0)
+        self.assertTrue(sim["short"])
+        empty = {**spec, "market": "KRW-XRP", "base_key": "none"}       # 봉이 거의 없으면 못 한다
+        with mock.patch.object(upbit, "get_candles", return_value=[]), mock.patch.object(simjob, "sync_candles"):
+            self.assertEqual(simjob.run(empty, self.folder, self.cfg), "error")
+        self.assertIn("봉이 0개뿐", simjob.read_state(self.folder)["message"])
 
     def test_requests_are_checked_and_one_job_runs_at_a_time(self):
         req = lambda **d: web.simjob_request(self.path, self.path, self.cfg, d)
@@ -1358,6 +1512,52 @@ class ReportTest(TempDbTest):
         self.assertIn("명령어", reports.command_reply("안녕", self.db))       # 모르는 말에는 안내
         self.assertIn("주식 봇이 아직", reports.command_reply("/주식", self.db, "/no/such.db"))
 
+    def test_signals_pi_and_view_buttons(self):
+        status = {"updated_at": "2026-11-14 13:05:00", "slots": [
+            {"name": "비트코인", "market": "KRW-BTC", "tf_label": "4시간", "holding": True, "strategy": {"name": "combo"},
+             "rule": {"buy": ["macd", "momentum"], "buy_op": "and", "sell": ["macd", "turtle"], "sell_op": "and"},
+             "plan": {"signals": {"macd": True, "momentum": False, "turtle": True}, "note": ""}},
+            {"name": "이더리움", "market": "KRW-ETH", "tf_label": "4시간", "holding": False, "strategy": {"name": "ma_cross"},
+             "rule": {"buy": ["ma_cross"], "buy_op": "and", "sell": ["ma_cross"], "sell_op": "and"},
+             "plan": {"buy_at_open": False, "sell_at_open": False, "note": "5일선 91 / 20일선 100"}}]}
+        text = reports.signals_text(status, None)
+        self.assertIn("• 비트코인 4시간 · 🟢 보유", text)
+        self.assertIn("살 때 🔴MACD 그리고 🔵모멘텀 · 팔 때 🔴MACD 그리고 🔴터틀 트레이딩", text)
+        self.assertIn("🔵이동평균 골든크로스", text)                          # 계획이 '그대로'고 안 들고 있으면 팔자
+        self.assertEqual([reports.view_of(w) for w in ("/상태", "/stock@my_bot", "/신호", "/pi", "/기록")],
+                         ["coin", "stock", "signal", "pi", None])
+        self.assertEqual(reports.view_buttons("pi")[1], ("🔄 새로고침", "view:pi"))
+        pi = reports.pi_text({"server_time": "2026-11-14 13:05:00", "model": "Raspberry Pi 3 Model B", "temp_c": 52.1,
+                              "load": 1.0, "cpus": 4, "mem_used_mb": 300, "mem_total_mb": 906, "uptime_sec": 3 * 86400 + 3700,
+                              "power_w": 2.1, "power_measured": False, "power_w_recommended": 12.5, "undervoltage_now": False})
+        self.assertIn("🌡 온도 52.1°C", pi)
+        self.assertIn("CPU 약 25%", pi)
+        self.assertIn("전력 약 2.1W (추정, 권장 어댑터 12.5W)", pi)
+        self.assertIn("켜진 지 3일 1시간 1분", pi)
+        self.assertIn("전압 정상", pi)
+
+    def test_price_alerts(self):
+        self.assertEqual([alerts.parse_won(w) for w in ("1억", "9500만", "1억 2000만", "95,000,000원", "250", "0.5", "abc", "")],
+                         [1e8, 9.5e7, 1.2e8, 9.5e7, 250, 0.5, None, None])
+        self.assertEqual([alerts.won_text(v) for v in (1e8, 9.5e7, 1.2e8, 3500, 0.25)],
+                         ["1억원", "9,500만원", "1억 2,000만원", "3,500원", "0.25원"])
+        self.db.set_state("markets", {"list": [{"market": "KRW-BTC", "name": "비트코인"}, {"market": "KRW-DOGE", "name": "도지코인"}]})
+        self.assertIn("못 찾았어요", alerts.command("/알림 NOPE 1억", self.db)[0])
+        with mock.patch.object(alerts.upbit, "get_prices", return_value={"KRW-BTC": 95_000_000}):
+            self.assertIn("1억원 이상으로 오르면", alerts.command("/알림 BTC 1억", self.db)[0])
+        with mock.patch.object(alerts.upbit, "get_prices", return_value={"KRW-DOGE": 300}):
+            self.assertIn("250원 이하로 내리면", alerts.command("/alert 도지코인 250", self.db)[0])
+        text, buttons = alerts.command("/알림", self.db)
+        self.assertIn("가격 알림 2개", text)
+        self.assertEqual(buttons[0][0], "🗑 비트코인 1억원 이상")
+        self.assertEqual(alerts.due(self.db, {"KRW-BTC": 99_000_000, "KRW-DOGE": 260}), [])   # 아직
+        hits = alerts.due(self.db, {"KRW-BTC": 100_100_000, "KRW-DOGE": 260})
+        self.assertIn("비트코인 1억원 넘었어요", alerts.hit_text(*hits[0]))
+        self.assertEqual(len(alerts.alerts(self.db)), 1)                   # 알린 건 지운다
+        self.assertIsNotNone(alerts.delete(self.db, buttons[1][1][len(alerts.DELETE):]))
+        self.assertIn("없어요", alerts.command("/알림", self.db)[0])
+        self.assertIsNone(alerts.command("/상태", self.db))
+
     def test_morning_report_once_per_day(self):
         cfg = {section: dict(values) for section, values in DEFAULTS.items()}
         bot = Bot(cfg, self.db, lambda mode: PaperExecutor(0.0005))
@@ -1385,9 +1585,10 @@ class WebLoginTest(TempDbTest):
         self.server = web.ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.sent = []
+        self.sent, self.buttons = [], []
         patches = [mock.patch("mypie.telegram.load", return_value=("t", "1")),
-                   mock.patch("mypie.telegram.send", side_effect=lambda text, creds=None: self.sent.append(text))]
+                   mock.patch("mypie.telegram.send", side_effect=lambda text, creds=None, buttons=None:
+                              (self.sent.append(text), self.buttons.append(buttons)))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -1428,6 +1629,30 @@ class WebLoginTest(TempDbTest):
         self.request("/api/logout", {}, cookie=session)
         self.assertEqual(self.request("/api/status", cookie=session)[0], 401)
 
+    def test_telegram_button_lets_the_browser_in(self):
+        """코드와 같은 메시지의 [✅ 들여보내기]를 누르면, 기다리던 로그인 화면이 저절로 들어간다."""
+        ask = json.loads(self.request("/api/login/send", {})[1])["ask"]
+        self.assertEqual(self.buttons[-1], [[("✅ 들여보내기", f"login:yes:{ask}"), ("🙅 거절", f"login:no:{ask}")]])  # 집 안이라 IP 막기는 없다
+        body, cookie = self.request("/api/login/wait", {"ask": ask})[1:]
+        self.assertTrue(json.loads(body)["waiting"])
+        self.assertIsNone(cookie)
+        self.assertIsNone(auth.answer_ask(self.db, "nope", True))
+        self.assertEqual(auth.take_ask(self.db, ask, "10.0.0.9"), "gone")    # 다른 기기(IP)는 못 가져간다
+        auth.answer_ask(self.db, ask, True)                                 # 텔레그램에서 [✅ 들여보내기]
+        self.assertIsNone(auth.answer_ask(self.db, ask, False))             # 한 번 답하면 끝
+        body, cookie = self.request("/api/login/wait", {"ask": ask})[1:]
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertEqual(self.request("/api/status", cookie=cookie.split(";")[0])[0], 200)
+        self.assertFalse(json.loads(self.request("/api/login/wait", {"ask": ask})[1])["ok"])  # 한 번만
+        self.assertIsNone(self.db.get_state(auth.CODE_KEY))                  # 버튼으로 들어왔으니 코드는 지운다
+
+    def test_telegram_button_can_refuse(self):
+        ask = json.loads(self.request("/api/login/send", {})[1])["ask"]
+        auth.answer_ask(self.db, ask, False)                                # [🙅 거절]
+        self.assertTrue(json.loads(self.request("/api/login/wait", {"ask": ask})[1])["rejected"])
+        self.assertIsNone(self.db.get_state(auth.CODE_KEY))                  # 거절하면 코드도 못 쓴다
+
     def test_logout_also_forgets_the_ip(self):
         auth.trust_ip(self.db, "127.0.0.1", 24)
         self.assertEqual(self.request("/api/status")[0], 200)
@@ -1439,15 +1664,47 @@ class WebLoginTest(TempDbTest):
             self.assertEqual(self.request("/api/status")[0], 200)
 
 
+class CurveTest(TempDbTest):
+    """계좌 카드의 작은 그래프: 실제 매매와 봉 종가로 전략 수익률과 그냥 들고 있었다면을 다시 그린다."""
+
+    TRADES = [{"ts": "2026-10-21 10:00:00", "side": "buy", "price": 100, "krw": 1000, "fee": 0.5},
+              {"ts": "2026-10-21 13:00:00", "side": "sell", "price": 120, "krw": 1200, "fee": 0.6}]
+    BARS = [("2026-10-21 09:00:00", 99), ("2026-10-21 12:00:00", 110), ("2026-10-21 14:00:00", 90)]
+
+    def test_follows_the_trades(self):
+        points = curve.build(self.TRADES, self.BARS, price_now=80, now="2026-10-21 15:00:00")["points"]
+        self.assertEqual(points[0], ["2026-10-21 10:00:00", 0.0, 0.0])    # 첫 매매부터 (그 전 봉은 버린다)
+        self.assertAlmostEqual(points[1][1], (0.9995 * 1.1 - 1) * 100)      # 들고 있는 동안은 가격만큼
+        self.assertAlmostEqual(points[2][1], (0.9995 * 1.2 * 0.9995 - 1) * 100)  # 판 뒤에는 그대로
+        self.assertAlmostEqual(points[-1][1], points[2][1])
+        self.assertEqual([round(p[2], 6) for p in points[1:]], [10.0, -10.0, -20.0])  # 그냥 들고 있었다면: 첫 매매 가격부터
+        self.assertEqual(curve.build([], self.BARS)["points"], [])           # 매매가 없으면 그래프도 없다
+
+    def test_starts_with_a_sell_when_it_already_held(self):
+        trades = [{"ts": "2026-10-21 10:00:00", "side": "sell", "price": 100, "krw": 1000, "fee": 0}]
+        points = curve.build(trades, self.BARS)["points"]
+        self.assertEqual([p[1] for p in points], [0.0, 0.0, 0.0])           # 팔고 나서는 움직이지 않는다
+
+    def test_coin_account_from_the_database(self):
+        self.db.set_state("status", {"mode": "paper", "slots": [{"id": "s1", "market": "KRW-BTC", "tf": "240m", "price": 120}]})
+        for trade in self.TRADES:
+            self.db.add_trade("paper", "KRW-BTC", {**trade, "volume": 1, "slot": "s1"})
+        self.db.upsert_candles("KRW-BTC", [candle("2026-10-21T03:00", 100, 111, 99, 110)], "240m")
+        data = web.build_curve(self.path, "/no/such.db", "coin", "s1")
+        self.assertGreaterEqual(len(data["points"]), 2)
+        self.assertEqual(web.build_curve(self.path, "/no/such.db", "coin", "nope")["points"], [])
+
+
 class SshWatchTest(unittest.TestCase):
     def test_alerts_outside_logins_and_sums_up_failures_twice_a_day(self):
-        sent, now = [], [datetime(2026, 10, 22, 9, 0, tzinfo=KST)]
-        watch = sshwatch.SshWatch(sent.append, now=lambda: now[0])
+        sent, buttons, now = [], [], [datetime(2026, 10, 22, 9, 0, tzinfo=KST)]
+        watch = sshwatch.SshWatch(lambda text, keys=None: (sent.append(text), buttons.append(keys)), now=lambda: now[0])
         watch.handle("Accepted publickey for pi from 192.168.0.20 port 4933 ssh2: ED25519 SHA256:x")
         self.assertEqual(sent, [])                                       # 집 안 PC 로그인은 조용히
         watch.handle("Accepted password for pi from 45.67.89.10 port 5000 ssh2")
         self.assertIn("45.67.89.10", sent[-1])                           # 집 밖 로그인은 바로
         self.assertIn("비밀번호", sent[-1])
+        self.assertEqual(buttons[-1], [("🚫 45.67.89.10 막기", "ban:45.67.89.10")])  # 이 IP 막기 버튼
         for port in (40000, 40001, 40002):
             watch.handle(f"Invalid user admin from 91.200.12.34 port {port}")
             watch.handle(f"Failed password for invalid user admin from 91.200.12.34 port {port} ssh2")  # 같은 접속은 한 번
@@ -1459,6 +1716,7 @@ class SshWatchTest(unittest.TestCase):
         self.assertIn("10/22 00:00~12:00 · 총 4번", sent[-1])
         self.assertIn("91.200.12.34 3번 (admin)", sent[-1])
         self.assertIn("192.168.0.7 (집 안) 1번 (root)", sent[-1])
+        self.assertEqual(buttons[-1], [("🚫 91.200.12.34 막기", "ban:91.200.12.34")])  # 집 안 IP는 막기 버튼이 없다
         now[0] = datetime(2026, 10, 23, 0, 0, 5, tzinfo=KST)
         watch.summarize()
         self.assertEqual(len(sent), 2)                                   # 실패가 없던 반나절은 안 보낸다
@@ -1466,6 +1724,31 @@ class SshWatchTest(unittest.TestCase):
         watch.handle("Failed password for pi from 45.67.89.10 port 6000 ssh2", late)
         self.assertTrue(watch.summarize())
         self.assertIn("10/22 12:00~24:00 · 총 1번", sent[-1])
+
+    def test_block_button_and_commands_call_the_firewall_tool(self):
+        """'IP 막기' 버튼·/차단목록·/차단해제는 sudo로 막기 도구를 부른다. 허락(firewall-setup.sh) 전이면 방법을 알려 준다."""
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[3:])
+            if cmd[3] == "list":
+                return mock.Mock(returncode=0, stdout="45.67.89.20\n45.67.89.10\n", stderr="")
+            return mock.Mock(returncode=0, stdout=cmd[4], stderr="")
+
+        with mock.patch.object(sshwatch.Path, "exists", return_value=True), mock.patch.object(sshwatch.subprocess, "run", run):
+            self.assertIn("45.67.89.20를 막았어요", sshwatch.block_text("45.67.89.20"))
+            self.assertIn("집 안 IP", sshwatch.block_text("192.168.0.7"))       # 집 안 IP는 부르지도 않는다
+            self.assertIn("막은 IP 2개", sshwatch.firewall_reply("/차단목록"))
+            self.assertIn("풀었어요", sshwatch.firewall_reply("/unblock 45.67.89.10"))
+            self.assertIn("예:", sshwatch.firewall_reply("/차단해제"))
+            self.assertIsNone(sshwatch.firewall_reply("/상태"))
+        self.assertEqual(calls, [["block", "45.67.89.20"], ["list"], ["unblock", "45.67.89.10"]])
+        denied = mock.Mock(returncode=1, stdout="", stderr="sudo: a password is required")
+        with mock.patch.object(sshwatch.Path, "exists", return_value=True), \
+                mock.patch.object(sshwatch.subprocess, "run", return_value=denied):
+            self.assertIn("firewall-setup.sh", sshwatch.block_text("45.67.89.20"))
+        with mock.patch.object(sshwatch.Path, "exists", return_value=False):
+            self.assertIn("firewall-setup.sh", sshwatch.firewall_reply("/차단목록"))
 
 
 if __name__ == "__main__":

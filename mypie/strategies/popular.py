@@ -31,15 +31,14 @@ class SqueezeMomentum(SignalStrategy):
             return NOT_ENOUGH
         h, l, c = [x["high"] for x in history], [x["low"] for x in history], closes(history)
 
-        def momentum(end: int) -> float:
-            # 종가 − (최근 n봉 가운데값과 n봉 평균의 평균)을 n봉 동안 직선으로 맞춘 끝값
-            gaps = [c[j] - ((max(h[j - n + 1:j + 1]) + min(l[j - n + 1:j + 1])) / 2 + sum(c[j - n + 1:j + 1]) / n) / 2
-                    for j in range(end - n, end)]
-            return linreg(gaps, n)
-
-        val, prev = momentum(len(c)), momentum(len(c) - 1)
+        # 힘: 종가 − (최근 n봉 가운데값과 n봉 평균의 평균)을 n봉 동안 직선으로 맞춘 끝값. 이번 봉과 직전 봉은 n−1개가 겹쳐서
+        # 그 n+1개를 한 번만 구한다
+        end = len(c)
+        gaps = [c[j] - ((max(h[j - n + 1:j + 1]) + min(l[j - n + 1:j + 1])) / 2 + sum(c[j - n + 1:j + 1]) / n) / 2
+                for j in range(end - n - 1, end)]
+        val, prev = linreg(gaps[1:], n), linreg(gaps[:-1], n)
         bb_low, _, bb_up = bollinger(c, n, float(self.params["bb_mult"]))
-        ma, rng = sma(c, n), sma(true_ranges(h, l, c), n)
+        ma, rng = sma(c, n), sma(true_ranges(h[-n - 1:], l[-n - 1:], c[-n - 1:])[1:], n)  # 평균 흔들림은 마지막 n개만
         k = float(self.params["kc_mult"])
         squeeze = bb_low > ma - rng * k and bb_up < ma + rng * k  # 볼린저 띠가 켈트너 띠 안에 쏙 들어감
         power = f"힘 {val / c[-1] * 100:+.2f}% ({'커지는 중' if val > prev else '줄어드는 중'})"
