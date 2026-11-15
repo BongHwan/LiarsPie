@@ -348,6 +348,29 @@ class StopLossTest(unittest.TestCase):
         self.assertEqual([(f["i"], f["side"]) for f in plain["detail"]["fills"]],  # 손절이 없으면 신호대로만 (d4에 판다)
                          [(0, "buy"), (3, "sell"), (4, "buy")])
 
+    def test_breakout_checks_stop_only_when_price_crossed_after_entry(self):
+        class Breakout(Strategy):
+            def plan(self, history, today_open):
+                return DayPlan(buy_stop=100)
+
+        for opening, close, expected in ((110, 105, 99), (95, 85, 90), (95, 110, None)):
+            with self.subTest(opening=opening, close=close):
+                bar = candle("d0", opening, 120, 80, close)
+                result = backtest.simulate(Breakout(), [bar], 0, warmup=0, detail=True, stop_loss=10)
+                fills = result["detail"]["fills"]
+                if expected is None:
+                    self.assertEqual([fill["side"] for fill in fills], ["buy"])
+                else:
+                    self.assertEqual([fill["side"] for fill in fills], ["buy", "sell"])
+                    self.assertTrue(fills[-1]["stop_loss"])
+                    self.assertAlmostEqual(fills[-1]["price"], expected)
+                search_ctx = simulation.context("coin", DEFAULTS, "1d", 10)
+                search_ctx["fee"] = 0
+                optimized = combosearch.trade([0], [100], [0], [float("nan")],
+                                              {k: [bar[k]] for k in ("open", "high", "low", "close")}, search_ctx, 0)
+                self.assertEqual(optimized["trades"], result["trades"])
+                self.assertAlmostEqual(optimized["total_return"], result["total_return"])
+
     def test_higher_strategy_stop_fires_first(self):
         class Trail(Script):
             def plan(self, history, today_open):
@@ -661,6 +684,24 @@ class BotFlowTest(TempDbTest):
         self.assertEqual(bot.book.slot("b")["coin"], eth_coin)          # '보유 유지' 계좌는 그대로
         self.assertGreater(bot.book.slot("a")["krw"], 0)                # 판 돈은 그 계좌에 남는다
 
+    def test_transfer_is_applied_once_after_interrupted_request(self):
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 0), vault=1000)
+        self.request(1, action="transfer", slot="a", amount=100)
+        bot = self.make_bot()
+        with mock.patch.object(self.db, "delete_state", side_effect=OSError("요청 처리 중단")):
+            with self.assertRaises(OSError):
+                bot._handle_requests()
+        self.assertEqual(bot.book.slot("a")["krw"], 0)
+        self.assertEqual(self.db.get_state("book:paper")["vault"], 1000)
+        self.assertIsNotNone(self.db.get_state("request:0001"))
+        restarted = self.make_bot()
+        restarted._handle_requests()
+        restarted._handle_requests()
+        self.assertEqual(restarted.book.slot("a")["krw"], 100)
+        self.assertEqual(restarted.book.vault, 900)
+        self.assertIsNone(self.db.get_state("request:0001"))
+        self.assertEqual([ok for ok, _ in self.results()], [True])
+
     def test_requests_add_transfer_change_and_sell_then_remove(self):
         self.accounts(vault=1_000_000)
         bot = self.make_bot()
@@ -859,6 +900,32 @@ class BotFlowTest(TempDbTest):
 
     # ---- 실거래 ----
 
+    def test_invest_ratio_caps_paper_and_live_buy_budget(self):
+        self.cfg["order"]["invest_ratio"] = 0.5
+        self.btc(self.D1, 125)
+        for mode in ("paper", "live"):
+            with self.subTest(mode=mode):
+                self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000), mode=mode, vault=100_000)
+                bot = self.make_bot()
+                self.go(bot, self.D1)
+                [trade] = self.db.trades(mode)
+                self.assertGreater(trade["krw"], 49_999)
+                self.assertLessEqual(trade["krw"], 50_000)
+                self.assertAlmostEqual(bot.book.slot("a")["krw"], 100_000 - trade["krw"])
+                self.assertEqual(bot.book.vault, 100_000)
+                if mode == "live":
+                    self.assertEqual(self.client.orders[-1]["price"], str(int(50_000 / 1.0005)))
+                self.db.delete_state("slot_state")
+
+    def test_invest_ratio_skips_order_below_minimum(self):
+        self.cfg["order"]["invest_ratio"] = 0.5
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 10_000), mode="live", vault=100_000)
+        self.btc(self.D1, 125)
+        bot = self.make_bot()
+        self.go(bot, self.D1)
+        self.assertEqual(self.client.attempts, 0)
+        self.assertEqual(bot.book.slot("a")["krw"], 10_000)
+
     def test_rejected_order_is_retried_without_pausing(self):
         self.accounts(("a", "KRW-BTC", "volatility_breakout", 50_000), mode="live", vault=950_000)
         self.client.reject = "bid"
@@ -879,12 +946,27 @@ class BotFlowTest(TempDbTest):
         self.go(bot, self.D1, errors_ok=True)
         self.assertEqual(bot.book.slot("a")["coin"], 0)                 # 장부는 아직 모름
         self.client.fail_wait = False
+        clear_pending = bot.executor.clear_pending
+
+        def interrupted_commit():
+            clear_pending()
+            raise OSError("체결 저장 중단")
+
+        with mock.patch.object(bot.executor, "clear_pending", side_effect=interrupted_commit):
+            with self.assertRaises(OSError):
+                bot._recover()
+        self.assertEqual(bot.book.slot("a")["coin"], 0)
+        self.assertIsNotNone(bot.executor.pending())
+        self.assertEqual(self.db.recent_trades(), [])
         rebooted = self.make_bot()                                      # 전원 복구
         self.go(rebooted, self.D1)
         self.assertEqual(self.client.attempts, 1)                       # 같은 주문을 또 내지 않는다
         self.assertGreater(rebooted.book.slot("a")["coin"], 0)
         self.assertIn("재시작 후 확인", self.db.recent_trades()[0]["reason"])
         self.assertIsNone(rebooted.executor.pending())
+        rebooted._recover()
+        self.assertEqual(rebooted.book.slot("a")["coin"], self.client.coins["BTC"])
+        self.assertEqual(len(self.db.recent_trades()), 1)
         self.assertEqual(len(rebooted.slots), 1)                        # 장부가 맞으니 바이앤홀드 계좌가 안 생긴다
 
     def test_power_loss_before_order_reached_upbit(self):
@@ -1236,6 +1318,17 @@ class LongSimulationTest(TempDbTest):
         return {"id": combo or base, "kind": "coin", "db": self.path, "market": "KRW-ETH", "tf": "1d", "days": 1095,
                 "bars": 1095, "rule": rule, "stop_loss": stop, "base_key": base, "combo_key": combo, "label": "ETH 3년",
                 "workers": 2}  # 리눅스(파이)에서는 CPU 둘에 나눠서, 윈도에서는 한 프로세스에서
+
+    def test_combo_search_uses_full_history_for_52_week_high(self):
+        bars = [candle(f"d{i:04d}", 100 + i, 101 + i, 99 + i, 100 + i) for i in range(320)]
+        ctx = simulation.context("stock", self.cfg, "1d", 0)
+        found = combosearch.search(bars, 60, ctx)
+        result = next(r for r in found["singles"] if r["name"] == "new_high_52w")
+        strategy = create_strategy("new_high_52w", registry=STOCK_STRATEGIES)
+        expected = backtest.simulate(strategy, bars, ctx["fee"], warmup=260,
+                                     sell_cost=ctx["sell_cost"], tick=ctx["tick"])
+        self.assertGreater(result["total_return"], 0)
+        self.assertAlmostEqual(result["total_return"], expected["total_return"], places=4)
 
     def test_combo_search_matches_the_simulation_and_keeps_history(self):
         """좋은 조합 찾기: 전략·쪽마다 한 번만 계산해도 진짜 시뮬레이션(make_rule + simulate)과 결과가 같다.
@@ -1667,32 +1760,41 @@ class WebLoginTest(TempDbTest):
 class CurveTest(TempDbTest):
     """계좌 카드의 작은 그래프: 실제 매매와 봉 종가로 전략 수익률과 그냥 들고 있었다면을 다시 그린다."""
 
-    TRADES = [{"ts": "2026-10-21 10:00:00", "side": "buy", "price": 100, "krw": 1000, "fee": 0.5},
-              {"ts": "2026-10-21 13:00:00", "side": "sell", "price": 120, "krw": 1200, "fee": 0.6}]
+    TRADES = [{"ts": "2026-10-21 10:00:00", "side": "buy", "price": 100, "krw": 1000.5, "fee": 0.5, "volume": 10},
+              {"ts": "2026-10-21 13:00:00", "side": "sell", "price": 120, "krw": 1199.4, "fee": 0.6, "volume": 10}]
     BARS = [("2026-10-21 09:00:00", 99), ("2026-10-21 12:00:00", 110), ("2026-10-21 14:00:00", 90)]
 
     def test_follows_the_trades(self):
         points = curve.build(self.TRADES, self.BARS, price_now=80, now="2026-10-21 15:00:00")["points"]
         self.assertEqual(points[0], ["2026-10-21 10:00:00", 0.0, 0.0])    # 첫 매매부터 (그 전 봉은 버린다)
-        self.assertAlmostEqual(points[1][1], (0.9995 * 1.1 - 1) * 100)      # 들고 있는 동안은 가격만큼
-        self.assertAlmostEqual(points[2][1], (0.9995 * 1.2 * 0.9995 - 1) * 100)  # 판 뒤에는 그대로
+        self.assertAlmostEqual(points[1][1], (1100 / 1000.5 - 1) * 100)
+        self.assertAlmostEqual(points[2][1], (1199.4 / 1000.5 - 1) * 100)
         self.assertAlmostEqual(points[-1][1], points[2][1])
         self.assertEqual([round(p[2], 6) for p in points[1:]], [10.0, -10.0, -20.0])  # 그냥 들고 있었다면: 첫 매매 가격부터
         self.assertEqual(curve.build([], self.BARS)["points"], [])           # 매매가 없으면 그래프도 없다
 
     def test_starts_with_a_sell_when_it_already_held(self):
-        trades = [{"ts": "2026-10-21 10:00:00", "side": "sell", "price": 100, "krw": 1000, "fee": 0}]
+        trades = [{"ts": "2026-10-21 10:00:00", "side": "sell", "price": 100, "krw": 1000, "volume": 10}]
         points = curve.build(trades, self.BARS)["points"]
         self.assertEqual([p[1] for p in points], [0.0, 0.0, 0.0])           # 팔고 나서는 움직이지 않는다
 
     def test_coin_account_from_the_database(self):
         self.db.set_state("status", {"mode": "paper", "slots": [{"id": "s1", "market": "KRW-BTC", "tf": "240m", "price": 120}]})
         for trade in self.TRADES:
-            self.db.add_trade("paper", "KRW-BTC", {**trade, "volume": 1, "slot": "s1"})
+            self.db.add_trade("paper", "KRW-BTC", {**trade, "slot": "s1"})
         self.db.upsert_candles("KRW-BTC", [candle("2026-10-21T03:00", 100, 111, 99, 110)], "240m")
         data = web.build_curve(self.path, "/no/such.db", "coin", "s1")
         self.assertGreaterEqual(len(data["points"]), 2)
         self.assertEqual(web.build_curve(self.path, "/no/such.db", "coin", "nope")["points"], [])
+
+    def test_partial_sell_keeps_remaining_units_in_the_curve(self):
+        trades = [{**self.TRADES[0], "krw": 1000, "fee": 0},
+                  {**self.TRADES[1], "price": 100, "krw": 100, "fee": 0, "volume": 1}]
+        for trade in trades:
+            self.db.add_trade("paper", "005930", {**trade, "slot": "s1"})
+        points = curve.build(curve.slot_trades(self.db, "paper", "s1"), [],
+                             price_now=200, now="2026-10-21 14:00:00")["points"]
+        self.assertAlmostEqual(points[-1][1], 90)
 
 
 class SshWatchTest(unittest.TestCase):

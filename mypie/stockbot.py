@@ -24,6 +24,7 @@ import signal
 import threading
 import time
 from dataclasses import asdict
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -35,7 +36,7 @@ from .stockbroker import LiveStockExecutor, PaperStockExecutor
 from .strategies import STOCK_STRATEGIES, DayPlan, create_strategy, strategy_params
 from .strategies.combo import check_rule, make_rule, normalize_rule, rule_label
 from .timeutil import KST, now_kst, ts
-from .vault import VaultBook, VaultError, new_slot_id
+from .vault import VaultBook, VaultError, book_transaction, new_slot_id
 
 log = logging.getLogger("mypie.stock")
 
@@ -630,11 +631,12 @@ class StockBot:
             self.executor.clear_pending()
             log.info("%s 매수 주문이 체결되지 않아서 취소했어요 (다음 루프에 그때 호가로 다시) · %s", slot.symbol, reason)
             return "none"
-        trade = self.book.apply_buy(slot.id, qty, fill_price, fee, reason)
-        trade["ref"] = ref
-        self.executor.clear_pending()
-        self._set_sstate(slot.id, last_buy_day=today, cut=False)
-        self.db.add_trade(self.executor.mode, slot.symbol, trade)
+        with book_transaction(self.book):
+            trade = self.book.apply_buy(slot.id, qty, fill_price, fee, reason)
+            trade["ref"] = ref
+            self._set_sstate(slot.id, last_buy_day=today, cut=False)
+            self.db.add_trade(self.executor.mode, slot.symbol, trade)
+            self.executor.clear_pending()
         self.event("info", f"🔴 {self._tag(slot)}매수 {qty:,}주 @ {fill_price:,.0f}원 ({trade['krw']:,.0f}원) · {reason}",
                    notify=True)
         return "filled"
@@ -653,10 +655,11 @@ class StockBot:
                 self.warned.add(key)
                 self.event("warning", f"{self._tag(slot)}매도 주문이 체결되지 않아서 취소했어요. 다음 루프에 그때 호가로 다시 해요 · {reason}")
             return
-        trade = self.book.apply_sell(slot.id, qty, fill_price, fee, tax, reason)
-        trade["ref"] = ref
-        self.executor.clear_pending()
-        self.db.add_trade(self.executor.mode, slot.symbol, trade)
+        with book_transaction(self.book):
+            trade = self.book.apply_sell(slot.id, qty, fill_price, fee, tax, reason)
+            trade["ref"] = ref
+            self.db.add_trade(self.executor.mode, slot.symbol, trade)
+            self.executor.clear_pending()
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
         self.event("info", f"🔵 {self._tag(slot)}매도 {qty:,}주 @ {fill_price:,.0f}원 · 손익 {trade['profit']:+,.0f}원 "
                            f"({pct:+.2f}%) · {reason}", notify=True)
@@ -670,14 +673,15 @@ class StockBot:
         sid = pending.get("slot")
         if fill and sid and self.book.has(sid):
             reason = f"{pending.get('reason', '')} · 재시작 후 확인".lstrip(" ·")
-            if pending["side"] == "buy":
-                trade = self.book.apply_buy(sid, fill["qty"], fill["price"], fill["fee"], reason)
-                if pending.get("day"):
-                    self._set_sstate(sid, last_buy_day=pending["day"])
-            else:
-                trade = self.book.apply_sell(sid, fill["qty"], fill["price"], fill["fee"], fill["tax"], reason)
-            self.executor.clear_pending()
-            self.db.add_trade(self.executor.mode, pending["symbol"], trade)
+            with book_transaction(self.book):
+                if pending["side"] == "buy":
+                    trade = self.book.apply_buy(sid, fill["qty"], fill["price"], fill["fee"], reason)
+                    if pending.get("day"):
+                        self._set_sstate(sid, last_buy_day=pending["day"], cut=False)
+                else:
+                    trade = self.book.apply_sell(sid, fill["qty"], fill["price"], fill["fee"], fill["tax"], reason)
+                self.db.add_trade(self.executor.mode, pending["symbol"], trade)
+                self.executor.clear_pending()
             self.event("warning", f"[실거래] 끊기기 전에 낸 {pending['symbol']} {side} 주문이 체결돼 있어서 장부에 "
                                   f"반영했어요 ({fill['qty']:,}주 @ {fill['price']:,.0f}원)", notify=True)
         else:
@@ -720,17 +724,22 @@ class StockBot:
 
     def _handle_requests(self, today: str) -> None:
         for key, request in self.db.states(REQUEST_PREFIX):
-            try:
-                message = self._apply_request(request, today)
-                ok = True
-            except VaultError as e:
-                message, ok = str(e), False
-            except (KeyError, TypeError, ValueError) as e:
-                message, ok = f"잘못된 요청이에요 ({e})", False
-            self.db.delete_state(key)
-            results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
-            results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
-            self.db.set_state("request_results", results)
+            is_transfer = request.get("action") == "transfer"
+            transaction = book_transaction(self.book) if is_transfer else nullcontext()
+            with transaction:
+                if is_transfer and self.db.get_state(key) is None:
+                    continue
+                try:
+                    message = self._apply_request(request, today)
+                    ok = True
+                except VaultError as e:
+                    message, ok = str(e), False
+                except (KeyError, TypeError, ValueError) as e:
+                    message, ok = f"잘못된 요청이에요 ({e})", False
+                self.db.delete_state(key)
+                results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
+                results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
+                self.db.set_state("request_results", results)
             self.event("info" if ok else "warning", message)
 
     @staticmethod

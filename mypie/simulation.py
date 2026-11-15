@@ -63,8 +63,10 @@ def folder(db_path: str | Path) -> Path:
 def keys(kind: str, market: str, tf: str, days: int, stop_loss: float, day: str, rule: dict | None) -> tuple[str, str | None]:
     """(모든 전략 결과의 이름, 조합 결과의 이름). 결과는 그날 하루 동안 다시 쓴다."""
     # 주식은 호가 한 칸을 넣고부터 계산이 달라져서 이름도 바꾼다 (그 전에 저장한 결과를 쓰지 않게)
-    base = hashlib.sha1(json.dumps([kind, market, tf, days, stop_loss, day] + (["tick"] if kind == "stock" else []))
-                        .encode()).hexdigest()[:16]
+    inputs = [kind, market, tf, days, stop_loss, day] + (["tick"] if kind == "stock" else [])
+    if stop_loss:
+        inputs.append("breakout-stop-v2")
+    base = hashlib.sha1(json.dumps(inputs).encode()).hexdigest()[:16]
     if not rule or is_simple(rule):
         return base, None
     return base, base + "-" + hashlib.sha1(json.dumps(rule, sort_keys=True).encode()).hexdigest()[:10]

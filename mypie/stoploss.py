@@ -27,5 +27,15 @@ def line(cost: float, units: float, pct: float) -> float | None:
     return cost / units * (1 - pct / 100)
 
 
+def breakout_exit(loss_line: float | None, trigger: float, opening: float, low: float, close: float) -> float | None:
+    """돌파 매수 이후에 손절선에 닿았다고 확인할 수 있는 봉만 처리한다."""
+    if loss_line is None:
+        return None
+    if opening >= trigger:
+        return min(opening, loss_line) if low <= loss_line else None
+    # 장중 돌파 전후의 순서는 알 수 없지만 종가는 매수 뒤 가격이다.
+    return loss_line if close <= loss_line else None
+
+
 def text(pct: float) -> str:
     return f"손절선 −{pct:g}%"

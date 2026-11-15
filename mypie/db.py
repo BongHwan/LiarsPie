@@ -5,6 +5,7 @@
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 from .timeutil import ts
@@ -94,12 +95,22 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
+    @contextmanager
+    def transaction(self):
+        """이미 시작된 트랜잭션 안에서는 호출자가 커밋을 맡는다."""
+        if self.conn.in_transaction:
+            yield
+        else:
+            with self.conn:
+                self.conn.execute("BEGIN")
+                yield
+
     def get_state(self, key: str, default=None):
         row = self.conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
         return json.loads(row["value"]) if row else default
 
     def set_state(self, key: str, value) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -107,7 +118,7 @@ class Database:
             )
 
     def delete_state(self, key: str) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute("DELETE FROM kv WHERE key = ?", (key,))
 
     def states(self, prefix: str) -> list[tuple[str, object]]:
@@ -117,7 +128,7 @@ class Database:
         return [(row["key"], json.loads(row["value"])) for row in rows]
 
     def upsert_candles(self, market: str, candles: list[dict], tf: str = "1d") -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.executemany(
                 "INSERT OR REPLACE INTO bars (market, tf, day, open, high, low, close, volume) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -137,7 +148,7 @@ class Database:
         return row["n"], row["oldest"]
 
     def add_trade(self, mode: str, market: str, trade: dict) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 "INSERT INTO trades (ts, mode, market, side, price, volume, krw, fee, profit, reason, slot, ref) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -146,14 +157,14 @@ class Database:
             )
 
     def add_event(self, level: str, message: str) -> None:
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 "INSERT INTO events (ts, level, message) VALUES (?, ?, ?)", (ts(), level, message)
             )
             self.conn.execute("DELETE FROM events WHERE id <= ?", (cur.lastrowid - MAX_EVENTS,))
 
     def add_equity(self, account: str, price: float, equity: float) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 "INSERT OR REPLACE INTO equity_log (account, ts, price, equity) VALUES (?, ?, ?, ?)",
                 (account, ts(), price, equity),

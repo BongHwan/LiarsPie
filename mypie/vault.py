@@ -12,6 +12,8 @@
 """
 
 import uuid
+from contextlib import contextmanager
+from copy import deepcopy
 
 from .buyhold import add_flow
 from .db import Database
@@ -28,6 +30,18 @@ def new_slot_id() -> str:
 
 class VaultError(ValueError):
     """사람이 요청한 이체·삭제가 안 될 때. 메시지는 화면에 그대로 보여준다."""
+
+
+@contextmanager
+def book_transaction(book):
+    """장부를 포함한 저장이 실패하면 DB와 메모리 장부를 모두 되돌린다."""
+    previous = deepcopy(book.data)
+    try:
+        with book.db.transaction():
+            yield
+    except BaseException:
+        book.data = previous
+        raise
 
 
 class VaultBook:

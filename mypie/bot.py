@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 from dataclasses import asdict
+from contextlib import nullcontext
 from datetime import timedelta
 
 from . import alerts, auth, backtest, buyhold, network, reports, sshwatch, stoploss, telegram, timeframes, upbit
@@ -36,7 +37,7 @@ from .strategies import STRATEGIES, DayPlan, create_strategy, strategy_params
 from .strategies.combo import check_rule, make_rule, normalize_rule, rule_label
 from .timeframes import bar_key, next_bar
 from .timeutil import KST, now_kst, trading_day, ts
-from .vault import VaultError
+from .vault import VaultError, book_transaction
 
 log = logging.getLogger("mypie.bot")
 
@@ -107,6 +108,10 @@ class Bot:
         self.notifier = telegram.Notifier()  # 텔레그램 알림 (연결돼 있고 알림을 켰을 때만 보낸다)
         self.interval = float(cfg["general"]["interval_sec"])
         self.fee_rate = float(cfg["paper"]["fee_rate"])
+        ratio = cfg.get("order", {}).get("invest_ratio", 1.0)
+        if type(ratio) not in (int, float) or not 0 <= ratio <= 1:
+            raise ValueError("[order].invest_ratio는 0 이상 1 이하의 숫자여야 해요")
+        self.invest_ratio = ratio
         self.backtest_days = int(cfg["backtest"]["days"])
         self.rank_by = cfg["backtest"]["rank_by"]
 
@@ -526,21 +531,28 @@ class Bot:
     # 주문 오류는 그대로 위로 올려 보낸다. 루프가 잠시 기다렸다 다시 시도하고,
     # 결과를 모르는 주문은 다음 루프의 _recover()가 업비트에 물어서 정리한다.
 
+    def _buy_budget(self, slot: Slot) -> float:
+        return self.book.slot(slot.id)["krw"] * self.invest_ratio
+
+    def _min_buy_budget(self) -> float:
+        return MIN_ORDER_KRW * (1 + self.fee_rate) if self.executor.mode == "live" else MIN_ORDER_KRW
+
     def _buy(self, slot: Slot, price: float, day: str, reason: str) -> bool:
         """그 계좌 원화로만 산다. 원화가 없는 계좌는 지켜보기만 한다."""
-        amount = self.book.slot(slot.id)["krw"]
-        if amount < MIN_ORDER_KRW:
+        amount = self._buy_budget(slot)
+        if amount < self._min_buy_budget():
             if amount > 0 and (slot.id, day) not in self.warned:
                 self.warned.add((slot.id, day))
-                self.event("warning", f"{self._tag(slot)}매수 신호가 났지만 계좌 원화 {amount:,.0f}원이 최소 주문 금액 "
-                                      f"{MIN_ORDER_KRW:,}원보다 적어요 · 금고에서 넣어 주세요")
+                self.event("warning", f"{self._tag(slot)}매수 신호가 났지만 매수 예산 {amount:,.0f}원이 "
+                                      f"최소 필요 금액({self._min_buy_budget():,.2f}원)보다 적어요 · 금고에서 더 넣어 주세요")
             return False
         note = {"slot": slot.id, "reason": reason, "day": day}
         volume, funds, fee = self.executor.buy(slot.market, amount, price, note)
-        trade = self.book.apply_buy(slot.id, volume, funds, fee, reason)
-        self.executor.clear_pending()
-        self._set_sstate(slot.id, last_buy_day=day, cut=False)
-        self.db.add_trade(self.executor.mode, slot.market, trade)
+        with book_transaction(self.book):
+            trade = self.book.apply_buy(slot.id, volume, funds, fee, reason)
+            self._set_sstate(slot.id, last_buy_day=day, cut=False)
+            self.db.add_trade(self.executor.mode, slot.market, trade)
+            self.executor.clear_pending()
         self.event("info", f"🔴 {self._tag(slot)}매수 {trade['volume']:.8g} @ {trade['price']:,.0f}원 "
                            f"({trade['krw']:,.0f}원) · {reason}", notify=True)
         return True
@@ -552,9 +564,10 @@ class Bot:
             self.book.clear_dust(slot.id)
             self.event("info", f"{self._tag(slot)}최소 주문 금액보다 적은 자투리라 장부에서만 정리했어요")
             return True
-        trade = self.book.apply_sell(slot.id, *fill, reason)
-        self.executor.clear_pending()
-        self.db.add_trade(self.executor.mode, slot.market, trade)
+        with book_transaction(self.book):
+            trade = self.book.apply_sell(slot.id, *fill, reason)
+            self.db.add_trade(self.executor.mode, slot.market, trade)
+            self.executor.clear_pending()
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
         self.event("info", f"🔵 {self._tag(slot)}매도 {trade['volume']:.8g} @ {trade['price']:,.0f}원 · "
                            f"손익 {trade['profit']:+,.0f}원 ({pct:+.2f}%) · {reason}", notify=True)
@@ -577,11 +590,12 @@ class Bot:
                 return
             reason = f"{pending.get('reason', '')} · 재시작 후 확인".lstrip(" ·")
             apply = self.book.apply_buy if pending["side"] == "bid" else self.book.apply_sell
-            trade = apply(slot_id, *result["fill"], reason)
-            self.executor.clear_pending()
-            self.db.add_trade(self.executor.mode, market, trade)
-            if pending["side"] == "bid" and pending.get("day"):
-                self._set_sstate(slot_id, last_buy_day=pending["day"])
+            with book_transaction(self.book):
+                trade = apply(slot_id, *result["fill"], reason)
+                self.db.add_trade(self.executor.mode, market, trade)
+                if pending["side"] == "bid" and pending.get("day"):
+                    self._set_sstate(slot_id, last_buy_day=pending["day"], cut=False)
+                self.executor.clear_pending()
             self.event("warning", f"[실거래] 끊기기 전에 낸 {market} {side} 주문이 체결돼 있어서 장부에 반영했어요 "
                                   f"({volume:.8g} @ {funds / volume:,.0f}원)", notify=True)
         else:
@@ -622,16 +636,21 @@ class Bot:
     def _handle_requests(self) -> None:
         """웹페이지 요청을 하나씩 처리하고 결과를 남긴다. 통신 오류면 요청을 남겨 두고 다음 루프에서 다시."""
         for key, request in self.db.states(REQUEST_PREFIX):
-            try:
-                message, ok = self._apply_request(request), True
-            except VaultError as e:
-                message, ok = str(e), False
-            except (KeyError, TypeError, ValueError) as e:
-                message, ok = f"잘못된 요청이에요 ({e})", False
-            self.db.delete_state(key)
-            results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
-            results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
-            self.db.set_state("request_results", results)
+            is_transfer = request.get("action") == "transfer"
+            transaction = book_transaction(self.book) if is_transfer else nullcontext()
+            with transaction:
+                if is_transfer and self.db.get_state(key) is None:
+                    continue
+                try:
+                    message, ok = self._apply_request(request), True
+                except VaultError as e:
+                    message, ok = str(e), False
+                except (KeyError, TypeError, ValueError) as e:
+                    message, ok = f"잘못된 요청이에요 ({e})", False
+                self.db.delete_state(key)
+                results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
+                results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
+                self.db.set_state("request_results", results)
             self.event("info" if ok else "warning", message, notify=ok)
 
     def _rule_text(self, rule: dict, tf: str, stop: float) -> str:
@@ -848,9 +867,14 @@ class Bot:
         daily = slot.tf == "1d"
         at = next_bar(slot.tf).astimezone(KST).strftime("%H:%M")
         krw = self.book.slot(slot.id)["krw"]
-        if not self._holding(slot, price) and krw < MIN_ORDER_KRW:
-            return ("원화가 없어서 지켜보기만 해요 · 금고에서 넣으면 이 전략대로 사고팔아요" if krw <= 0
-                    else f"원화 {krw:,.0f}원은 최소 주문 금액({MIN_ORDER_KRW:,}원)보다 적어요 · 금고에서 더 넣어 주세요")
+        if not self._holding(slot, price):
+            if self.invest_ratio == 0:
+                return "매수 비율이 0%라 새로 사지 않아요"
+            if krw <= 0:
+                return "원화가 없어서 지켜보기만 해요 · 금고에서 넣으면 이 전략대로 사고팔아요"
+            if self._buy_budget(slot) < self._min_buy_budget():
+                return (f"매수 예산 {self._buy_budget(slot):,.0f}원은 최소 필요 금액"
+                        f"({self._min_buy_budget():,.2f}원)보다 적어요 · 금고에서 더 넣어 주세요")
         if self._holding(slot, price):
             loss = self._loss_line(slot)
             cut = f" · {stoploss.text(slot.stop_loss)} {loss:,.0f}원" if loss is not None else ""

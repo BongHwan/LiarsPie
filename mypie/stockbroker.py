@@ -3,7 +3,7 @@
   - PaperStockExecutor: 모의투자. 정해 준 지정가(그 순간의 호가)에 바로 체결됐다고 보고 수수료·세금만 뗀다.
   - LiveStockExecutor: 토스증권 실거래. 주문마다 우리가 만든 번호(client_id)를 붙이고, 주문 직전에
     '진행 중인 주문'으로 DB에 적어 둔다. 정전·통신 끊김으로 결과를 모르게 되면 recover()가
-    토스증권에 물어서 체결됐으면 장부에 반영하게 하고, 안 들어갔으면 지운다.
+    토스증권에 물어서 확인한 체결만 장부에 반영하게 한다. 주문을 특정할 수 없으면 확인을 보류한다.
 
 주문은 시장가 대신 지정가로 낸다. 값은 주식 봇이 그 순간의 호가로 정해 준다 (살 때는 가장 싼 매도 호가, 팔 때는 가장
 비싼 매수 호가: 바로 체결되는 값). 국내 시장가 매수가 상한가 기준으로 돈을 묶어서 살 수 있는 수량이 줄어드는 문제도 없다.
@@ -13,6 +13,7 @@
 
 import time
 import uuid
+from datetime import date
 
 from . import krx, toss
 from .db import Database
@@ -122,7 +123,7 @@ class LiveStockExecutor:
         self.db.delete_state(self.PENDING_KEY)
 
     def recover(self) -> dict | None:
-        """끊기기 전 주문이 있으면 {"pending": 그 주문, "fill": 체결 결과 또는 None(안 들어감·체결 0)}."""
+        """끊기기 전 주문이 있으면 확인된 체결 결과를 돌려준다. 미확정 주문은 남겨 둔다."""
         pending = self.pending()
         if not pending:
             return None
@@ -130,10 +131,18 @@ class LiveStockExecutor:
             if pending.get("order_id"):
                 order = self.client.order(pending["order_id"])
             else:
-                order = self.client.find_order(pending["client_id"], pending["symbol"])
-            if order is not None and order["status"] not in FINAL:
+                client_id, submitted_at = pending.get("client_id"), pending.get("at")
+                if not client_id or not submitted_at:
+                    raise toss.OrderUnknown("미확정 주문의 요청 ID 또는 제출 시각이 없어요")
+                order = self.client.find_order(client_id, pending["symbol"],
+                                               submitted_on=date.fromisoformat(submitted_at[:10]))
+                if order is None:
+                    raise toss.OrderUnknown("주문 요청 ID가 일치하는 주문을 아직 찾지 못했어요")
+                pending["order_id"] = order["id"]
+                self.db.set_state(self.PENDING_KEY, pending)
+            if order["status"] not in FINAL:
                 order = self._settle(order["id"])
         except toss.TossError as e:
             raise toss.OrderUnknown(f"끊기기 전 주문을 확인하지 못했어요: {e}") from e
-        fill = self._fill(order, pending["side"]) if order else None
-        return {"pending": pending, "fill": fill if fill and fill["qty"] else None}
+        fill = self._fill(order, pending["side"])
+        return {"pending": pending, "fill": fill if fill["qty"] else None}

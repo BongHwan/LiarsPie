@@ -86,6 +86,11 @@ def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: i
             stopped = True
         if not coin and not bought and not stopped and plan.buy_stop is not None and day["high"] >= plan.buy_stop:
             buy(max(day["open"], plan.buy_stop))
+            exit_price = stoploss.breakout_exit(stoploss.line(cost, coin, stop_loss), plan.buy_stop,
+                                                day["open"], day["low"], day["close"])
+            if exit_price is not None:
+                sell(exit_price, loss=True)
+                cut = True
 
         equity = cash + coin * day["close"]
         days_holding += 1 if coin else 0

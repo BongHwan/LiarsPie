@@ -103,7 +103,7 @@ class FakeToss:
     def order(self, oid):
         return dict(self.orders[oid])
 
-    def find_order(self, client_id, symbol):
+    def find_order(self, client_id, symbol, *, submitted_on):
         return next((dict(o) for o in self.orders.values() if o["client_id"] == client_id), None)
 
     def cancel(self, oid):
@@ -248,6 +248,34 @@ class StockBotTest(TempDb):
 
     def slot(self, bot):
         return next(iter(bot.book.data["slots"].values()))
+
+    def test_transfer_is_applied_once_after_interrupted_request(self):
+        bot = self.make_bot()
+        self.assertTrue(bot._ready())
+        bot.book.add_slot("a", self.SYMBOL, "테스트", "buy_and_hold")
+        starting_cash = bot.book.vault
+        self.request(1, action="transfer", slot="a", amount=100)
+        set_state = self.db.set_state
+
+        def interrupted_result(key, value):
+            if key == "request_results":
+                raise OSError("요청 결과 저장 중단")
+            set_state(key, value)
+
+        with mock.patch.object(self.db, "set_state", side_effect=interrupted_result):
+            with self.assertRaises(OSError):
+                bot._handle_requests(DAY1)
+        self.assertEqual(bot.book.slot("a")["cash"], 0)
+        self.assertEqual(self.db.get_state("book:paper")["vault"], starting_cash)
+        self.assertIsNotNone(self.db.get_state("request:0001"))
+        restarted = self.make_bot()
+        self.assertTrue(restarted._ready())
+        restarted._handle_requests(DAY1)
+        restarted._handle_requests(DAY1)
+        self.assertEqual(restarted.book.slot("a")["cash"], 100)
+        self.assertEqual(restarted.book.vault, starting_cash - 100)
+        self.assertIsNone(self.db.get_state("request:0001"))
+        self.assertEqual([ok for ok, _ in self.results()], [True])
 
     def test_new_keys_are_used_without_a_restart(self):
         """⚙️ 설정에서 키를 바꾸면 (.env가 바뀌면) 봇이 다시 켜지지 않아도 새 키로 연결한다."""
@@ -648,14 +676,65 @@ class StockBotTest(TempDb):
         # 주문은 들어갔는데 결과를 적기 전에 전원이 나간 상황
         oid = self.toss.place_order(self.SYMBOL, "buy", 3, 101_000, "mypie-x")
         self.db.set_state(LiveStockExecutor.PENDING_KEY, {"client_id": "mypie-x", "symbol": self.SYMBOL, "side": "buy",
-                                                          "qty": 3, "slot": sid, "day": DAY1, "reason": "매수 신호"})
+                                                          "qty": 3, "slot": sid, "day": DAY1, "reason": "매수 신호",
+                                                          "at": f"{DAY1} 08:31:00"})
+        clear_pending = bot.executor.clear_pending
+
+        def interrupted_commit():
+            clear_pending()
+            raise OSError("체결 저장 중단")
+
+        with mock.patch.object(bot.executor, "clear_pending", side_effect=interrupted_commit):
+            with self.assertRaises(OSError):
+                bot._recover()
+        self.assertEqual(bot.book.slot(sid)["qty"], 0)
+        self.assertIsNotNone(bot.executor.pending())
+        self.assertEqual(self.trades(), [])
         bot2 = self.make_bot("live")
         bot2.step(at(DAY1, "09:01"))
         self.assertEqual(self.trades()[0], ("buy", self.SYMBOL, 3))
         self.assertEqual(self.slot(bot2)["qty"], 3)
         self.assertEqual(len(self.toss.placed), 1)                       # 다시 사지 않는다 (오늘 이미 샀음)
         self.assertIsNone(self.db.get_state(LiveStockExecutor.PENDING_KEY))
+        bot2._recover()
+        self.assertEqual(self.slot(bot2)["qty"], 3)
+        self.assertEqual(len(self.trades()), 1)
         self.assertTrue(oid)
+
+    def test_recovery_requires_matching_client_order_id(self):
+        client = toss.TossClient("fake-id", "fake-secret", "1")
+        executor = LiveStockExecutor(self.db, client, 0, 0)
+        pending = {"client_id": "new", "symbol": self.SYMBOL, "side": "buy", "qty": 2,
+                   "price": 100, "at": f"{DAY1} 10:00:00"}
+        self.db.set_state(executor.PENDING_KEY, pending)
+        previous = {"orderId": "previous", "symbol": self.SYMBOL, "side": "SELL", "status": "FILLED",
+                    "quantity": "7", "price": "90", "execution": {"filledQuantity": "7", "averageFilledPrice": "90"}}
+        current = {"orderId": "current", "symbol": self.SYMBOL, "side": "BUY", "status": "FILLED",
+                   "quantity": "2", "price": "100", "execution": {"filledQuantity": "2", "averageFilledPrice": "100"}}
+        closed = [previous, current]
+
+        def order_list(method, path, query, *, account):
+            self.assertEqual((method, path, account), ("GET", "/api/v1/orders", True))
+            if query["status"] == "OPEN":
+                return {"orders": []}
+            self.assertEqual(query["from"], DAY1)
+            self.assertEqual(query["to"], DAY2)
+            return {"orders": closed}
+
+        with mock.patch.object(client, "_call", side_effect=order_list), \
+                mock.patch.object(toss, "now_kst", return_value=at(DAY2, "09:00")):
+            with self.assertRaises(toss.OrderUnknown):
+                executor.recover()
+            self.assertEqual(executor.pending(), pending)
+            current["clientOrderId"] = "new"
+            closed.append({**current, "orderId": "duplicate"})
+            with self.assertRaises(toss.OrderUnknown):
+                executor.recover()
+            self.assertEqual(executor.pending(), pending)
+            closed.pop()
+            result = executor.recover()
+        self.assertEqual(result["fill"]["qty"], 2)
+        self.assertEqual(executor.pending()["order_id"], "current")
 
     def test_partial_fill_is_recorded_and_rest_cancelled(self):
         self.toss.set(self.SYMBOL, DAY1, 100_000)

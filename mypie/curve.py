@@ -1,8 +1,7 @@
 """계좌 카드의 작은 그래프: 이 계좌가 첫 매매부터 전략대로 사고판 수익률과, 그때 사서 그냥 들고 있었다면의 수익률.
 
-실제 매매 기록(가격·수수료)과 봉 종가로 다시 그린다. 이 봇은 계좌 돈 전부로 사고 전부 파니까,
-들고 있는 동안은 가격만큼 움직이고 판 뒤에는 그대로다. 중간에 넣고 뺀 돈은 수익률에 섞지 않는다
-(시뮬레이션 그래프와 같은 방식). 그래서 넣은 돈 기준인 '계좌 수익률'과는 조금 다를 수 있다.
+실제 체결 수량과 결제 금액으로 보유 수량과 현금을 재구성하고, 봉 종가로 평가한다.
+시작 자산과 이후 자금 이동은 매매 기록에서 확인할 수 있는 범위에서 추정한다.
 """
 
 from datetime import date, datetime, timedelta
@@ -16,30 +15,39 @@ MAX_POINTS = 160  # 카드 안 작은 그래프라 이 정도면 충분하다
 
 def build(trades: list[dict], bars: list[tuple[str, float]], price_now: float | None = None,
           now: str | None = None) -> dict:
-    """trades: 이 계좌 매매 (오래된 것부터, ts·side·price·krw·fee). bars: (봉이 끝나는 시각, 종가) 오래된 것부터.
+    """trades: 이 계좌 매매 (오래된 것부터, ts·side·price·krw·volume). bars: (봉이 끝나는 시각, 종가) 오래된 것부터.
     {"start": 첫 매매 시각, "points": [[시각, 전략 %, 그냥 들고 있었다면 %], ...]}. 매매가 없으면 points가 비어 있다."""
     if not trades:
         return {"start": None, "points": []}
-    start, ref = trades[0]["ts"], float(trades[0]["price"])  # 바이앤홀드는 첫 매매 가격에 샀다고 친다
-    holding = trades[0]["side"] == "sell"  # 처음이 매도면 그 전부터 들고 있었다
-    index, mark, i = 1.0, ref, 0  # 전략 지수, 마지막으로 값을 매긴 가격, 다음 매매
+    first = trades[0]
+    start, ref = first["ts"], float(first["price"])
+    cash = float(first["krw"]) if first["side"] == "buy" else 0.0
+    units = float(first["volume"]) if first["side"] == "sell" else 0.0
+    basis, i = cash + units * ref, 0
     points = [[start, 0.0, 0.0]]
 
     def trade_until(when: str | None) -> None:
-        nonlocal index, mark, holding, i
+        nonlocal cash, units, basis, i
         while i < len(trades) and (when is None or trades[i]["ts"] <= when):
             t = trades[i]
-            if holding:
-                index *= float(t["price"]) / mark
-            index *= 1 - (float(t["fee"]) / float(t["krw"]) if t["krw"] else 0.0)
-            holding, mark, i = t["side"] == "buy", float(t["price"]), i + 1
+            price, volume, amount = float(t["price"]), float(t["volume"]), float(t["krw"])
+            buying = t["side"] == "buy"
+            # 기록에 없는 현금·현물 유입은 수익으로 계산하지 않는다.
+            missing = max(amount - cash, 0.0) if buying else max(volume - units, 0.0) * price
+            if missing:
+                equity = cash + units * price
+                basis = basis * (1 + missing / equity) if equity > 0 else missing
+            if buying:
+                cash = max(cash - amount, 0.0)
+                units += volume
+            else:
+                cash += amount
+                units = max(units - volume, 0.0)
+            i += 1
 
     def point(when: str, price: float) -> None:
-        nonlocal index, mark
-        if holding:
-            index *= price / mark
-        mark = price
-        points.append([when, (index - 1) * 100, (price / ref - 1) * 100])
+        equity = cash + units * price
+        points.append([when, (equity / basis - 1) * 100, (price / ref - 1) * 100])
 
     for end, close in bars:
         if end <= start:
@@ -56,7 +64,7 @@ def build(trades: list[dict], bars: list[tuple[str, float]], price_now: float | 
 
 
 def slot_trades(db: Database, mode: str, slot: str) -> list[dict]:
-    return db._rows("SELECT ts, side, price, krw, fee FROM trades WHERE mode = ? AND slot = ? ORDER BY id", (mode, slot))
+    return db._rows("SELECT ts, side, price, krw, volume FROM trades WHERE mode = ? AND slot = ? ORDER BY id", (mode, slot))
 
 
 def coin(db: Database, status: dict, slot_id: str) -> dict:

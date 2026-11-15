@@ -12,7 +12,7 @@ db_path = "data/mypie.db" # 기록 저장 위치
 name = "volatility_breakout"  # 처음 쓸 전략
 
 [order]
-invest_ratio = 1.0        # 매수할 때 (봇) 원화 중 쓸 비율 (0.5 = 절반만)
+invest_ratio = 1.0        # 코인 계좌 원화에서 매수 예산(수수료 포함)으로 쓸 비율 (0.5 = 절반, 0 = 매수 안 함)
 min_order_krw = 5000      # 업비트 최소 주문 금액
 
 [paper]

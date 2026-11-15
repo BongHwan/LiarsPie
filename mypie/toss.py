@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import date, timedelta
 
 from .keys import ENV_PATH, read_env, write_env
 from .timeutil import now_kst
@@ -356,32 +356,30 @@ class TossClient:
                 "fee": _num(commission) if commission not in (None, "") else None,
                 "tax": _num(tax) if tax not in (None, "") else None}
 
-    def find_order(self, client_id: str, symbol: str, side: str | None = None, qty: int | None = None,
-                   price: float | None = None, since: str | None = None) -> dict | None:
-        """주문번호를 적기 전에 끊겼을 때: 오늘 주문 중에 종목·방향·수량·가격·시각이 맞는 것을 찾는다.
-        (토스증권은 우리 번호로 주문을 찾는 기능이 없다)"""
-        today = now_kst().date().isoformat()
-        orders = (self._call("GET", "/api/v1/orders", {"status": "OPEN", "symbol": symbol}, account=True) or {}).get("orders") or []
-        cursor = None
-        while True:
-            page = self._call("GET", "/api/v1/orders", {"status": "CLOSED", "symbol": symbol, "from": today, "to": today,
-                                                        "limit": 100, "cursor": cursor}, account=True) or {}
-            orders += page.get("orders") or []
-            if not page.get("hasNext"):
-                break
-            cursor = page.get("nextCursor")
-        for o in sorted(orders, key=lambda x: x.get("orderedAt") or ""):
-            info = self._order(o)
-            if side and info["side"] != side:
-                continue
-            if qty and info["qty"] != qty:
-                continue
-            if price and info["price"] and abs(info["price"] - price) > 0.5:
-                continue
-            if since and (o.get("orderedAt") or "")[:19].replace("T", " ") < since:
-                continue
-            return info
-        return None
+    def find_order(self, client_id: str, symbol: str, *, submitted_on: date) -> dict | None:
+        """거래소 응답에서 주문 요청 ID가 일치하는 주문만 찾는다."""
+        matches = {}
+        for status in ("OPEN", "CLOSED"):
+            query = {"status": status, "symbol": symbol, "limit": 100}
+            if status == "CLOSED":
+                last_day = min(now_kst().date(), submitted_on + timedelta(days=1))
+                query.update({"from": submitted_on.isoformat(), "to": last_day.isoformat()})
+            seen_cursors = set()
+            while True:
+                page = self._call("GET", "/api/v1/orders", query, account=True) or {}
+                for order in page.get("orders") or []:
+                    if order.get("clientOrderId") == client_id and order.get("symbol") == symbol:
+                        matches[order["orderId"]] = self._order(order)
+                if not page.get("hasNext"):
+                    break
+                cursor = page.get("nextCursor")
+                if not cursor or cursor in seen_cursors:
+                    raise OrderUnknown("주문 목록의 다음 페이지를 확인하지 못했어요")
+                seen_cursors.add(cursor)
+                query["cursor"] = cursor
+        if len(matches) > 1:
+            raise OrderUnknown("같은 주문 요청 ID에 해당하는 주문이 여러 건이에요")
+        return next(iter(matches.values()), None)
 
     def cancel(self, order_id: str) -> None:
         try:

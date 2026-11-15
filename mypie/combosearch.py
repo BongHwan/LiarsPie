@@ -128,15 +128,19 @@ def trade(buy_open, buy_stop, sell_open, sell_stop, bars: dict, ctx: dict, mid: 
         elif s_stop is not None and lo[k] <= s_stop:
             price = min(o[k], s_stop)
             stopped = True
+        b_stop = buy_stop[k]
+        if not coin and not bought and not stopped and b_stop == b_stop and h[k] >= b_stop:
+            price = up(max(o[k], b_stop))
+            coin, cost, cash = cash / ((1 + fee) * price), cash, 0.0
+            exit_price = stoploss.breakout_exit(stoploss.line(cost, coin, stop_pct), b_stop, o[k], lo[k], c[k])
+            if exit_price is not None:
+                price = exit_price
+                stopped = cut = True
         if stopped:
             cash = coin * down(price) * (1 - fee - cost_out)
             trades += 1
             wins += cash > cost
             coin = cost = 0.0
-        b_stop = buy_stop[k]
-        if not coin and not bought and not stopped and b_stop == b_stop and h[k] >= b_stop:
-            price = up(max(o[k], b_stop))
-            coin, cost, cash = cash / ((1 + fee) * price), cash, 0.0
         equity = cash + coin * c[k]
         held += 1 if coin else 0
         if equity > peak:
@@ -229,8 +233,7 @@ def search(candles: list[dict], bars: int, ctx: dict, workers: int = 1, progress
         progress("prep", 0, len(names) + 1)
     pre = dict(_map(_prep, [*names, HOLD], workers, tick("prep", len(names) + 1)))
     _shared["pre"] = pre
-    small = min(_shared["windows"])
-    _shared["single"] = {n: single_side(pre[n][small]) for n in [*names, HOLD]}
+    _shared["single"] = {n: single_side(pre[n][windows[n]]) for n in [*names, HOLD]}
     singles = {n: trade(*_shared["single"][n], _shared["bars"], ctx, _shared["mid"]) for n in [*names, HOLD]}
     hold = singles.pop(HOLD)
     top = sorted(names, key=lambda n: singles[n]["score"], reverse=True)[:TOP]
