@@ -17,6 +17,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -701,6 +702,44 @@ class BotFlowTest(TempDbTest):
         self.assertEqual(restarted.book.vault, 900)
         self.assertIsNone(self.db.get_state("request:0001"))
         self.assertEqual([ok for ok, _ in self.results()], [True])
+
+    def test_cash_and_account_creation_survive_interrupted_request(self):
+        bot = self.make_bot()
+        bot.prices["KRW-BTC"] = 100
+        starting_cash = bot.book.vault
+        set_state = self.db.set_state
+
+        def interrupted_result(key, value):
+            if key == "request_results":
+                raise OSError("요청 결과 저장 중단")
+            set_state(key, value)
+
+        requests = ({"action": "paper_cash", "amount": 200},
+                    {"action": "paper_cash", "amount": -100},
+                    dict(action="add", market="KRW-BTC", tf="1d", strategy="buy_and_hold", amount=50))
+        for i, request in enumerate(requests, 1):
+            with self.subTest(request=request):
+                key = f"request:{i:04d}"
+                self.request(i, **request)
+                before = self.db.get_state("book:paper")
+                with mock.patch.object(self.db, "set_state", side_effect=interrupted_result):
+                    with self.assertRaises(OSError):
+                        bot._handle_requests()
+                self.assertEqual(bot.book.data, before)
+                self.assertEqual(self.db.get_state("book:paper"), before)
+                self.assertEqual(bot.slots, [])
+                self.assertIsNotNone(self.db.get_state(key))
+                bot = self.make_bot()
+                bot.prices["KRW-BTC"] = 100
+                bot._handle_requests()
+                bot._handle_requests()
+                self.assertIsNone(self.db.get_state(key))
+                self.assertEqual([ok for ok, _ in self.results()], [True] * i)
+
+        [slot] = bot.slots
+        self.assertEqual(bot.book.slot(slot.id)["krw"], 50)
+        self.assertEqual(bot.book.vault, starting_cash + 50)
+        self.assertEqual(bot.book.data["contributions"], starting_cash + 100)
 
     def test_requests_add_transfer_change_and_sell_then_remove(self):
         self.accounts(vault=1_000_000)
@@ -1450,6 +1489,39 @@ class LongSimulationTest(TempDbTest):
         self.assertEqual((code, body["busy"]), (409, True))             # 다른 계산이 도는 중
         self.assertEqual(req(action="stop")[1]["job"]["id"], "other")
         self.assertTrue((self.folder / simjob.STOP).exists())
+
+    def test_concurrent_start_requests_launch_only_one_process(self):
+        competing_reads = threading.Barrier(2)
+        load = simulation.load
+
+        def read(path):
+            state = load(path)
+            if path.name == simjob.STATE and state is None:
+                try:
+                    competing_reads.wait(timeout=1)
+                except threading.BrokenBarrierError:
+                    pass  # 첫 요청이 시작을 마칠 때까지 두 번째 요청은 상태를 읽지 못한다
+            return state
+
+        def start_simulation():
+            return web.simjob_request(self.path, self.path, self.cfg, {
+                "action": "start", "kind": "coin", "query": "market=KRW-ETH&tf=1d&days=1095"})
+
+        def start_search():
+            return web.search_request(self.path, self.path, self.cfg, {
+                "action": "start", "kind": "coin", "market": "KRW-ETH", "tf": "1d", "years": 1})
+
+        proc = mock.Mock(pid=12345)
+        proc.poll.return_value = None
+        with mock.patch.object(simjob, "_procs", {}), mock.patch.object(simulation, "load", side_effect=read), \
+                mock.patch.object(simjob.subprocess, "Popen", return_value=proc) as spawn:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(start) for start in (start_simulation, start_search)]
+                responses = [future.result(timeout=5) for future in futures]
+            spawn.assert_called_once()
+            self.assertEqual(sorted(code for code, _ in responses), [200, 409])
+            self.assertEqual(responses[0][1]["job"]["id"], responses[1][1]["job"]["id"])
+            self.assertEqual(load(self.folder / simjob.SPEC)["id"], responses[0][1]["job"]["id"])
 
     def test_thin_keeps_holding_state_per_point(self):
         idx = simulation.sample(5000)

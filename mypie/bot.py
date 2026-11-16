@@ -636,10 +636,11 @@ class Bot:
     def _handle_requests(self) -> None:
         """웹페이지 요청을 하나씩 처리하고 결과를 남긴다. 통신 오류면 요청을 남겨 두고 다음 루프에서 다시."""
         for key, request in self.db.states(REQUEST_PREFIX):
-            is_transfer = request.get("action") == "transfer"
-            transaction = book_transaction(self.book) if is_transfer else nullcontext()
+            action = request.get("action")
+            atomic = action in ("transfer", "paper_cash", "add")
+            transaction = book_transaction(self.book) if atomic else nullcontext()
             with transaction:
-                if is_transfer and self.db.get_state(key) is None:
+                if atomic and self.db.get_state(key) is None:
                     continue
                 try:
                     message, ok = self._apply_request(request), True
@@ -651,6 +652,8 @@ class Bot:
                 results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
                 results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
                 self.db.set_state("request_results", results)
+            if ok and action == "add":
+                self._load_slots()
             self.event("info" if ok else "warning", message, notify=ok)
 
     def _rule_text(self, rule: dict, tf: str, stop: float) -> str:
@@ -690,7 +693,6 @@ class Bot:
             self.book.set_stop(sid, stop)
             if amount > 0:
                 self.book.transfer(sid, amount)
-            self._load_slots()
             return (f"{self.book.slot(sid)['name']} 계좌를 만들었어요 · {self._rule_text(rule, tf, stop)}"
                     + (f" · 금고에서 {amount:,.0f}원" if amount > 0 else ""))
 

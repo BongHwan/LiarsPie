@@ -350,7 +350,8 @@ class TossClient:
         ex = o.get("execution") or {}
         tax = ex.get("tax")
         commission = ex.get("commission")
-        return {"id": o["orderId"], "status": STATUS.get(o.get("status"), "open"), "side": (o.get("side") or "").lower(),
+        return {"id": o["orderId"], "symbol": o.get("symbol"), "client_id": o.get("clientOrderId"),
+                "status": STATUS.get(o.get("status"), "open"), "side": (o.get("side") or "").lower(),
                 "qty": int(_num(o.get("quantity"))), "price": _num(o.get("price")), "ordered_at": o.get("orderedAt"),
                 "filled_qty": int(_num(ex.get("filledQuantity"))), "avg_price": _num(ex.get("averageFilledPrice")),
                 "fee": _num(commission) if commission not in (None, "") else None,

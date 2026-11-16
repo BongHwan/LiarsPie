@@ -277,6 +277,44 @@ class StockBotTest(TempDb):
         self.assertIsNone(self.db.get_state("request:0001"))
         self.assertEqual([ok for ok, _ in self.results()], [True])
 
+    def test_cash_and_account_creation_survive_interrupted_request(self):
+        bot = self.make_bot()
+        self.assertTrue(bot._ready())
+        starting_cash = bot.book.vault
+        set_state = self.db.set_state
+
+        def interrupted_result(key, value):
+            if key == "request_results":
+                raise OSError("요청 결과 저장 중단")
+            set_state(key, value)
+
+        requests = ({"action": "paper_cash", "amount": 200},
+                    {"action": "paper_cash", "amount": -100},
+                    dict(action="add", symbol=self.SYMBOL, strategy="buy_and_hold", amount=50))
+        for i, request in enumerate(requests, 1):
+            with self.subTest(request=request):
+                key = f"request:{i:04d}"
+                self.request(i, **request)
+                before = self.db.get_state("book:paper")
+                with mock.patch.object(self.db, "set_state", side_effect=interrupted_result):
+                    with self.assertRaises(OSError):
+                        bot._handle_requests(DAY1)
+                self.assertEqual(bot.book.data, before)
+                self.assertEqual(self.db.get_state("book:paper"), before)
+                self.assertEqual(bot.slots, [])
+                self.assertIsNotNone(self.db.get_state(key))
+                bot = self.make_bot()
+                self.assertTrue(bot._ready())
+                bot._handle_requests(DAY1)
+                bot._handle_requests(DAY1)
+                self.assertIsNone(self.db.get_state(key))
+                self.assertEqual([ok for ok, _ in self.results()], [True] * i)
+
+        [slot] = bot.slots
+        self.assertEqual(bot.book.slot(slot.id)["cash"], 50)
+        self.assertEqual(bot.book.vault, starting_cash + 50)
+        self.assertEqual(bot.book.data["contributions"], starting_cash + 100)
+
     def test_new_keys_are_used_without_a_restart(self):
         """⚙️ 설정에서 키를 바꾸면 (.env가 바뀌면) 봇이 다시 켜지지 않아도 새 키로 연결한다."""
         stamps = iter([1, 2])
@@ -700,6 +738,28 @@ class StockBotTest(TempDb):
         self.assertEqual(self.slot(bot2)["qty"], 3)
         self.assertEqual(len(self.trades()), 1)
         self.assertTrue(oid)
+
+    def test_links_operator_confirmed_closed_order_without_client_order_id(self):
+        client = toss.TossClient("fake-id", "fake-secret", "1")
+        executor = LiveStockExecutor(self.db, client, 0, 0)
+        pending = {"client_id": "missing-from-list", "account": "1", "symbol": self.SYMBOL,
+                   "side": "buy", "qty": 2, "price": 100, "at": f"{DAY1} 10:00:00"}
+        self.db.set_state(executor.PENDING_KEY, pending)
+        order = {"orderId": "verified", "symbol": self.SYMBOL, "side": "BUY", "status": "FILLED",
+                 "quantity": "2", "price": "100", "orderedAt": f"{DAY1}T01:00:05Z",
+                 "execution": {"filledQuantity": "2", "averageFilledPrice": "100"}}
+        with mock.patch.object(client, "_call") as call:
+            for mismatch in ({"side": "SELL"}, {"status": "PENDING"}, {"clientOrderId": "different"},
+                             {"orderedAt": f"{DAY1}T00:59:59Z"}):
+                call.return_value = {**order, **mismatch}
+                with self.assertRaises(toss.OrderUnknown):
+                    executor.link_closed_order("verified")
+                self.assertEqual(executor.pending(), pending)
+            call.return_value = order
+            executor.link_closed_order("verified")
+            self.assertEqual(executor.pending()["order_id"], "verified")
+            self.assertEqual(executor.recover()["fill"]["qty"], 2)
+            self.assertTrue(all(args.args[0] == "GET" for args in call.call_args_list))
 
     def test_recovery_requires_matching_client_order_id(self):
         client = toss.TossClient("fake-id", "fake-secret", "1")

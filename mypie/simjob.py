@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,13 +25,16 @@ STATE, STOP, SPEC, LOG = "job.json", "job.stop", "job_spec.json", "job.log"
 ROOT = Path(__file__).resolve().parent.parent
 WRITE_EVERY = 0.7  # 진행 상황을 이 간격(초)보다 자주 적지 않는다
 TELEGRAM_AFTER_SEC = 60  # 좋은 조합 찾기가 이보다 오래 걸렸으면 결과를 텔레그램으로도 보낸다
-_procs: list[subprocess.Popen] = []
+_job_lock = threading.Lock()
+_procs: dict[Path, subprocess.Popen] = {}
 
 
 Stopped = simulation.Stopped
 
 
 def _alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     if os.name == "nt":  # 윈도(개발 PC)의 os.kill(pid, 0)은 Ctrl+C를 보내 버려서 쓰지 않는다
         return True
     try:
@@ -42,43 +46,61 @@ def _alive(pid: int) -> bool:
 
 def read_state(folder: Path) -> dict:
     """지금(또는 마지막) 계산 작업 상태. 돌던 작업이 사라졌으면(파이 재시작 등) 멈춘 것으로 고친다."""
-    for p in list(_procs):
-        if p.poll() is not None:
-            _procs.remove(p)
+    with _job_lock:
+        return _read_state(folder.resolve())
+
+
+def _read_state(folder: Path) -> dict:
+    """호출자가 작업 잠금을 잡은 상태에서 읽는다."""
     state = simulation.load(folder / STATE) or {"state": "idle"}
-    if state.get("state") == "running" and not _alive(int(state.get("pid") or 0)):
-        state = {**state, "state": "stopped", "message": "계산이 중간에 멈췄어요 (파이가 다시 시작됐거나 오류)"}
-        simulation.save(folder / STATE, state)
+    proc = _procs.get(folder)
+    if proc is not None:
+        alive = proc.poll() is None
+        if alive:
+            return {**state, "pid": proc.pid}
+        del _procs[folder]
+        # 종료 직전에 파일에 쓴 최종 상태를 놓치지 않는다.
+        state = simulation.load(folder / STATE) or state
+    if state.get("state") == "running":
+        if proc is not None or not _alive(int(state.get("pid") or 0)):
+            state = {**state, "state": "stopped", "message": "계산이 중간에 멈췄어요 (파이가 다시 시작됐거나 오류)"}
+            simulation.save(folder / STATE, state)
     return state
 
 
 def start(folder: Path, spec: dict) -> tuple[bool, dict]:
     """계산 작업을 띄운다. 다른 계산이 돌고 있으면 (False, 그 상태)."""
-    state = read_state(folder)
-    if state.get("state") == "running":
-        return state.get("id") == spec["id"], state
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / STOP).unlink(missing_ok=True)
-    simulation.save(folder / SPEC, spec)
-    state = {"id": spec["id"], "label": spec["label"], "state": "running", "phase": "start", "done": 0, "total": 0,
-             "started": time.time(), "phase_started": time.time(), "pid": 0, "estimate_sec": spec.get("estimate_sec")}
-    simulation.save(folder / STATE, state)
-    with open(folder / LOG, "ab") as err:
-        proc = subprocess.Popen([sys.executable, "-m", "mypie.simjob", str(folder / SPEC)], cwd=str(ROOT),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
-                                preexec_fn=(lambda: os.nice(19)) if hasattr(os, "nice") else None)
-    _procs.append(proc)
-    state["pid"] = proc.pid
-    simulation.save(folder / STATE, state)
-    return True, state
+    folder = folder.resolve()
+    with _job_lock:
+        state = _read_state(folder)
+        if state.get("state") == "running" or folder in _procs:
+            return state.get("id") == spec["id"], state
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / STOP).unlink(missing_ok=True)
+        simulation.save(folder / SPEC, spec)
+        state = {"id": spec["id"], "label": spec["label"], "state": "running", "phase": "start", "done": 0, "total": 0,
+                 "started": time.time(), "phase_started": time.time(), "pid": 0, "estimate_sec": spec.get("estimate_sec")}
+        simulation.save(folder / STATE, state)
+        try:
+            with open(folder / LOG, "ab") as err:
+                proc = subprocess.Popen([sys.executable, "-m", "mypie.simjob", str(folder / SPEC)], cwd=str(ROOT),
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err)
+        except OSError:
+            simulation.save(folder / STATE, {**state, "state": "error", "message": "계산 작업을 시작하지 못했어요"})
+            raise
+        _procs[folder] = proc
+        # 시작 이후에는 작업 프로세스만 상태 파일을 쓴다.
+        return True, {**state, "pid": proc.pid}
 
 
 def stop(folder: Path) -> dict:
     """돌고 있는 계산에 멈춤 표시를 남긴다 (작업이 1~2초 안에 보고 멈춘다)."""
-    state = read_state(folder)
-    if state.get("state") == "running":
-        (folder / STOP).touch()
-    return state
+    folder = folder.resolve()
+    with _job_lock:
+        state = _read_state(folder)
+        if state.get("state") == "running":
+            (folder / STOP).touch()
+        return state
 
 
 class Progress:
@@ -260,6 +282,8 @@ def _tidy(folder: Path, keep: int = 30) -> None:
 
 def main(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if hasattr(os, "nice"):
+        os.nice(19)
     spec_path = Path(argv[0])
     run(json.loads(spec_path.read_text(encoding="utf-8")), spec_path.parent)
 

@@ -724,10 +724,11 @@ class StockBot:
 
     def _handle_requests(self, today: str) -> None:
         for key, request in self.db.states(REQUEST_PREFIX):
-            is_transfer = request.get("action") == "transfer"
-            transaction = book_transaction(self.book) if is_transfer else nullcontext()
+            action = request.get("action")
+            atomic = action in ("transfer", "paper_cash", "add")
+            transaction = book_transaction(self.book) if atomic else nullcontext()
             with transaction:
-                if is_transfer and self.db.get_state(key) is None:
+                if atomic and self.db.get_state(key) is None:
                     continue
                 try:
                     message = self._apply_request(request, today)
@@ -740,6 +741,9 @@ class StockBot:
                 results = (self.db.get_state("request_results") or [])[-(MAX_RESULTS - 1):]
                 results.append({"id": request.get("id"), "ok": ok, "message": message, "at": ts()})
                 self.db.set_state("request_results", results)
+            if ok and action == "add":
+                self._load_slots()
+                self.last_sync = 0.0  # 실거래면 원래 있던 이 종목 주식을 바로 가져오게
             self.event("info" if ok else "warning", message)
 
     @staticmethod
@@ -789,8 +793,6 @@ class StockBot:
             self.book.set_stop(sid, stop)
             if amount > 0:
                 self.book.transfer(sid, amount)
-            self._load_slots()
-            self.last_sync = 0.0  # 실거래면 원래 있던 이 종목 주식을 바로 가져오게
             return (f"{name} 종목 계좌를 만들었어요 · {self._rule_text(rule)}" + (f" · {stoploss.text(stop)}" if stop else "")
                     + (f" · 금고에서 {amount:,.0f}원" if amount > 0 else ""))
         sid = str(r["slot"])

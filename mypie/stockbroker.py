@@ -13,11 +13,11 @@
 
 import time
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 from . import krx, toss
 from .db import Database
-from .timeutil import ts
+from .timeutil import KST, ts
 
 FILL_WAIT_SEC = 10    # 이 시간 안에 다 안 되면 남은 수량을 취소한다 (다음 루프에 그때 호가로 다시)
 FINAL = ("filled", "cancelled", "rejected")
@@ -73,6 +73,7 @@ class LiveStockExecutor:
     def _place(self, symbol: str, side: str, qty: int, limit: int, note: dict) -> dict:
         pending = {"client_id": "mypie-" + uuid.uuid4().hex[:20], "symbol": symbol, "side": side, "qty": qty,
                    "price": limit, "at": ts(), **note}
+        pending["account"] = getattr(self.client, "account", None)
         self.db.set_state(self.PENDING_KEY, pending)  # 주문 직전에 적어 둔다 (정전 대비)
         try:
             order_id = self.client.place_order(symbol, side, qty, limit, pending["client_id"])
@@ -122,12 +123,44 @@ class LiveStockExecutor:
     def clear_pending(self) -> None:
         self.db.delete_state(self.PENDING_KEY)
 
+    def link_closed_order(self, order_id: str) -> None:
+        """사용자가 확인한 주문번호를 조회해 미확정 주문과 대조한 뒤 연결한다."""
+        pending = self.pending()
+        if not pending or pending.get("order_id"):
+            raise toss.OrderUnknown("주문번호를 연결할 미확정 주문이 없어요")
+        self._check_pending_account(pending)
+        order = self.client.order(order_id)
+        if order["status"] not in FINAL:
+            raise toss.OrderUnknown("토스증권에서 종료된 주문만 연결할 수 있어요")
+        if (order["id"] != order_id
+                or any(order.get(key) != pending.get(key) for key in ("symbol", "side", "qty", "price"))
+                or (order.get("client_id") and order["client_id"] != pending.get("client_id"))):
+            raise toss.OrderUnknown("입력한 주문번호의 주문 내용이 미확정 주문과 일치하지 않아요")
+        try:
+            submitted = datetime.fromisoformat(pending["at"]).replace(tzinfo=KST)
+            ordered = datetime.fromisoformat(order["ordered_at"])
+            if ordered.tzinfo is None:
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as e:
+            raise toss.OrderUnknown("두 주문의 제출 시각을 비교할 수 없어요") from e
+        if not 0 <= (ordered - submitted).total_seconds() <= 120:
+            raise toss.OrderUnknown("증권사 주문 시각이 봇의 제출 시각부터 2분 이내가 아니에요")
+        with self.db.transaction():
+            if self.pending() != pending:
+                raise toss.OrderUnknown("조회 중 미확정 주문이 바뀌었어요")
+            self.db.set_state(self.PENDING_KEY, {**pending, "order_id": order_id})
+
+    def _check_pending_account(self, pending: dict) -> None:
+        if pending.get("account") and pending["account"] != getattr(self.client, "account", None):
+            raise toss.OrderUnknown("미확정 주문을 제출한 토스증권 계좌와 현재 계좌가 달라요")
+
     def recover(self) -> dict | None:
         """끊기기 전 주문이 있으면 확인된 체결 결과를 돌려준다. 미확정 주문은 남겨 둔다."""
         pending = self.pending()
         if not pending:
             return None
         try:
+            self._check_pending_account(pending)
             if pending.get("order_id"):
                 order = self.client.order(pending["order_id"])
             else:
@@ -137,7 +170,8 @@ class LiveStockExecutor:
                 order = self.client.find_order(client_id, pending["symbol"],
                                                submitted_on=date.fromisoformat(submitted_at[:10]))
                 if order is None:
-                    raise toss.OrderUnknown("주문 요청 ID가 일치하는 주문을 아직 찾지 못했어요")
+                    raise toss.OrderUnknown("주문 요청 ID가 일치하는 주문을 찾지 못했어요. "
+                                            "종료된 주문을 토스증권에서 확인한 뒤 README의 주문번호 연결 절차를 따르세요")
                 pending["order_id"] = order["id"]
                 self.db.set_state(self.PENDING_KEY, pending)
             if order["status"] not in FINAL:
@@ -146,3 +180,34 @@ class LiveStockExecutor:
             raise toss.OrderUnknown(f"끊기기 전 주문을 확인하지 못했어요: {e}") from e
         fill = self._fill(order, pending["side"])
         return {"pending": pending, "fill": fill if fill["qty"] else None}
+
+
+def main() -> None:
+    import argparse
+    from pathlib import Path
+
+    from .config import load_config
+
+    parser = argparse.ArgumentParser(description="미확정 토스증권 주문에 직접 확인한 증권사 주문번호를 연결합니다")
+    parser.add_argument("--link-order", required=True, metavar="ORDER_ID")
+    args = parser.parse_args()
+    creds = toss.load_credentials()
+    if not creds:
+        parser.exit(1, "등록된 토스증권 키가 없어요.\n")
+    stock = load_config()["stock"]
+    path = Path(stock["db_path"])
+    if not path.is_file():
+        parser.exit(1, "주식 장부 DB를 찾지 못했어요.\n")
+    db = Database(path, create=False)
+    try:
+        executor = LiveStockExecutor(db, toss.TossClient(*creds, db=db), stock["fee_rate"], stock["sell_tax"])
+        executor.link_closed_order(args.link_order)
+    except toss.TossError as e:
+        parser.exit(1, f"주문번호 연결 실패: {e}\n")
+    finally:
+        db.close()
+    print("주문번호를 연결했어요. 주식 봇이 재개되면 체결을 다시 조회해 장부에 반영해요.")
+
+
+if __name__ == "__main__":
+    main()
