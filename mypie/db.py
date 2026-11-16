@@ -96,13 +96,13 @@ class Database:
         self.conn.close()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, immediate: bool = False):
         """이미 시작된 트랜잭션 안에서는 호출자가 커밋을 맡는다."""
         if self.conn.in_transaction:
             yield
         else:
             with self.conn:
-                self.conn.execute("BEGIN")
+                self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 yield
 
     def get_state(self, key: str, default=None):

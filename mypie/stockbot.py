@@ -550,12 +550,12 @@ class StockBot:
             loss = self._loss_line(slot)  # 손절선은 산 직후에도 지킨다
             today_open = (self.quotes.get(slot.symbol) or {}).get("open") or price
             if loss is not None and price <= loss:  # 계획 가격 = 시뮬레이션과 같이 min(시가, 이탈 가격)
-                self._sell(slot, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈", min(today_open, loss))
-                self._set_sstate(slot.id, last_stop_day=today, cut=True)
+                self._sell(slot, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈", min(today_open, loss),
+                           stop_state={"last_stop_day": today, "cut": True})
                 return
             if plan.sell_stop is not None and st.get("last_buy_day") != today and price <= plan.sell_stop:
-                self._sell(slot, f"{plan.sell_stop:,.0f}원 이탈", min(today_open, plan.sell_stop))
-                self._set_sstate(slot.id, last_stop_day=today)
+                self._sell(slot, f"{plan.sell_stop:,.0f}원 이탈", min(today_open, plan.sell_stop),
+                           stop_state={"last_stop_day": today})
         elif (plan.buy_stop is not None and price >= plan.buy_stop
               and st.get("last_buy_day") != today and st.get("last_stop_day") != today):
             # 계획 가격 = max(시가, 돌파 가격). 호가가 그보다 BUY_BAND 넘게 비싸면 이번엔 안 사고 다음 루프에 다시 본다
@@ -641,13 +641,16 @@ class StockBot:
                    notify=True)
         return "filled"
 
-    def _sell(self, slot: StockSlot, reason: str, ref: float | None = None) -> None:
+    def _sell(self, slot: StockSlot, reason: str, ref: float | None = None, *, stop_state: dict | None = None) -> None:
         """그 순간의 호가로 판다. 덜 팔리면 부른 쪽이 다음 루프에 그때 호가로 다시 부른다 (손절은 값을 따지지 않고 판다)."""
         reason = self._where(slot, reason)
         s = self.book.slot(slot.id)
         ref = ref or self.prices[slot.symbol]
+        note = {"slot": slot.id, "reason": reason}
+        if stop_state:
+            note["stop_state"] = stop_state
         qty, fill_price, fee, tax = self._call(self.executor.sell, slot.symbol, s["qty"], self._limit(slot, "sell"),
-                                               {"slot": slot.id, "reason": reason})
+                                               note)
         if qty <= 0:
             self.executor.clear_pending()
             key = (slot.id, "sell-retry", now_kst().date().isoformat())
@@ -659,6 +662,8 @@ class StockBot:
             trade = self.book.apply_sell(slot.id, qty, fill_price, fee, tax, reason)
             trade["ref"] = ref
             self.db.add_trade(self.executor.mode, slot.symbol, trade)
+            if stop_state:
+                self._set_sstate(slot.id, **stop_state)
             self.executor.clear_pending()
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
         self.event("info", f"🔵 {self._tag(slot)}매도 {qty:,}주 @ {fill_price:,.0f}원 · 손익 {trade['profit']:+,.0f}원 "
@@ -680,6 +685,8 @@ class StockBot:
                         self._set_sstate(sid, last_buy_day=pending["day"], cut=False)
                 else:
                     trade = self.book.apply_sell(sid, fill["qty"], fill["price"], fill["fee"], fill["tax"], reason)
+                    if pending.get("stop_state"):
+                        self._set_sstate(sid, **pending["stop_state"])
                 self.db.add_trade(self.executor.mode, pending["symbol"], trade)
                 self.executor.clear_pending()
             self.event("warning", f"[실거래] 끊기기 전에 낸 {pending['symbol']} {side} 주문이 체결돼 있어서 장부에 "

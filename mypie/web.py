@@ -94,7 +94,10 @@ def build_payload(db_path: str) -> dict:
         payload["events"] = db.recent_events(40)
         if status:
             payload["equity"] = db.equity_since(status["mode"], ts(now_kst() - timedelta(days=EQUITY_DAYS)))
-            payload["pending_order"] = db.get_state("live_pending_order") if status["mode"] == "live" else None
+            pending_order = db.get_state("live_pending_order") if status["mode"] == "live" else None
+            if pending_order:
+                pending_order.pop("key_fingerprint", None)
+            payload["pending_order"] = pending_order
         payload["rankings"] = db.get_state("rankings") or {}
         payload["ranking_request"] = db.get_state("ranking_request")
         payload["markets"] = (db.get_state("markets") or {}).get("list", [])

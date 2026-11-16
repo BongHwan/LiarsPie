@@ -32,11 +32,39 @@ _procs: dict[Path, subprocess.Popen] = {}
 Stopped = simulation.Stopped
 
 
+def _windows_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    invalid_parameter = 87
+    wait_object_0 = 0
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait.restype = wintypes.DWORD
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+
+    handle = open_process(synchronize, False, pid)
+    if not handle:
+        # 접근 거부 등 확인할 수 없는 경우에는 종료됐다고 판단하지 않는다.
+        return ctypes.get_last_error() != invalid_parameter
+    try:
+        return wait(handle, 0) != wait_object_0
+    finally:
+        close(handle)
+
+
 def _alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":  # 윈도(개발 PC)의 os.kill(pid, 0)은 Ctrl+C를 보내 버려서 쓰지 않는다
-        return True
+        return _windows_alive(pid)
     try:
         os.kill(pid, 0)
     except OSError:

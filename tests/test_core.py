@@ -11,6 +11,8 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -33,7 +35,7 @@ from mypie.strategies import STOCK_STRATEGIES, STRATEGIES, create_strategy, stra
 from mypie.strategies.base import DayPlan, Strategy, render_text
 from mypie.strategies.combo import check_rule, make_rule, normalize_rule, rule_fields
 from mypie.timeutil import KST, trading_day
-from mypie.upbit import OrderRejected, UpbitError, make_token
+from mypie.upbit import OrderRejected, OrderUnknown, UpbitError, make_token
 from mypie.vault import VaultError
 
 logging.disable(logging.CRITICAL)
@@ -54,7 +56,8 @@ class FakeClient:
 
     PRICE = 100.0
 
-    def __init__(self, krw=1_000_000.0, coins=None, reject=None):
+    def __init__(self, krw=1_000_000.0, coins=None, reject=None, *, access_key="fake-access"):
+        self.access_key = access_key
         self.krw, self.coins, self.reject = krw, dict(coins or {}), reject
         self.orders, self.filled, self.by_id = [], {}, {}
         self.attempts, self.fail_wait = 0, False
@@ -543,6 +546,35 @@ class LiveExecutorTest(TempDbTest):
         self.assertEqual(client.attempts, 0)
         self.assertIsNone(ex.pending())
 
+    def test_pending_order_is_not_looked_up_with_a_different_key(self):
+        original = FakeClient()
+        original.fail_wait = True
+        executor = LiveExecutor(self.db, original, 0.0005)
+        with self.assertRaises(OrderUnknown):
+            executor.buy("KRW-BTC", 100_000, 100, {"slot": "a"})
+        pending = executor.pending()
+        self.assertNotIn(original.access_key, json.dumps(pending))
+
+        other = FakeClient(access_key="different-access")
+        restarted = LiveExecutor(self.db, other, 0.0005)
+        with mock.patch.object(other, "get_order", wraps=other.get_order) as lookup:
+            with self.assertRaisesRegex(OrderUnknown, "현재 키가 달라"):
+                restarted.recover()
+            lookup.assert_not_called()
+        self.assertEqual(restarted.pending(), pending)
+
+        original.fail_wait = False
+        restarted.client = original
+        self.assertGreater(restarted.recover()["fill"][0], 0)
+
+    def test_unbound_pending_order_survives_not_found(self):
+        executor = LiveExecutor(self.db, FakeClient(), 0.0005)
+        pending = {"identifier": "legacy", "side": "bid", "market": "KRW-BTC"}
+        self.db.set_state(executor.PENDING_KEY, pending)
+        with self.assertRaisesRegex(OrderUnknown, "이전 버전"):
+            executor.recover()
+        self.assertEqual(executor.pending(), pending)
+
     def test_keeps_margin(self):
         client = FakeClient(krw=100_000)
         LiveExecutor(self.db, client, 0.0005).buy("KRW-BTC", 100_000, 100, {})
@@ -896,6 +928,30 @@ class BotFlowTest(TempDbTest):
         self.assertEqual(len(self.trades()), 2)
         self.assertIn("손절 뒤 쉬는 중", self.db.get_state("status")["slots"][0]["state_text"])
 
+    def test_recovered_stop_loss_keeps_buy_signal_blocked(self):
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000, {"stop_loss": 10}), mode="live")
+        bot = self.make_bot()
+        self.btc(self.D1, 100)
+        self.go(bot, self.D1)
+        self.assertEqual(self.trades(), [("buy", "KRW-BTC")])
+
+        self.btc(self.D1, 89)
+        self.client.fail_wait = True
+        self.go(bot, self.D1, errors_ok=True)
+        self.assertEqual(len(self.trades()), 1)
+        self.assertEqual(bot.executor.pending()["stop_state"], {"last_stop_day": self.D1, "cut": True})
+
+        self.client.fail_wait = False
+        restarted = self.make_bot()
+        self.btc(self.D2, 95)
+        self.go(restarted, self.D2, steps=2)
+        self.assertEqual(self.trades(), [("buy", "KRW-BTC"), ("sell", "KRW-BTC")])
+        self.assertEqual(self.client.attempts, 2)
+        self.assertIsNone(restarted.executor.pending())
+        state = restarted._sstate(restarted.slots[0])
+        self.assertTrue(state["cut"])
+        self.assertEqual(state["last_stop_day"], self.D1)
+
     def test_sold_account_is_not_bought_back_at_the_same_open(self):
         self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000))
         bot = self.make_bot()
@@ -1010,9 +1066,10 @@ class BotFlowTest(TempDbTest):
 
     def test_power_loss_before_order_reached_upbit(self):
         self.accounts(("a", "KRW-BTC", "volatility_breakout", 100_000), mode="live")
-        self.db.set_state(LiveExecutor.PENDING_KEY, {"identifier": "mypie-lost", "side": "bid", "market": "KRW-BTC",
-                                                     "slot": "a", "day": self.D1, "at": "2026-10-21 10:00:00"})
         bot = self.make_bot()
+        self.db.set_state(LiveExecutor.PENDING_KEY, {"identifier": "mypie-lost", "side": "bid", "market": "KRW-BTC",
+                                                     "slot": "a", "day": self.D1, "at": "2026-10-21 10:00:00",
+                                                     "key_fingerprint": bot.executor._key_fingerprint()})
         self.btc(self.D1, 125)
         self.go(bot, self.D1)                                          # 확인 → 안 들어갔음 → 바로 정상 매수
         self.assertEqual(self.client.attempts, 1)
@@ -1490,6 +1547,26 @@ class LongSimulationTest(TempDbTest):
         self.assertEqual(req(action="stop")[1]["job"]["id"], "other")
         self.assertTrue((self.folder / simjob.STOP).exists())
 
+    @unittest.skipUnless(os.name == "nt", "Windows 프로세스 상태 확인")
+    def test_windows_releases_stale_job_after_worker_exit(self):
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as worker:
+            try:
+                simulation.save(self.folder / simjob.STATE,
+                                {"id": "old", "state": "running", "pid": worker.pid})
+                self.assertEqual(simjob.read_state(self.folder)["state"], "running")
+            finally:
+                worker.stdin.close()
+                worker.wait(timeout=5)
+        self.assertEqual(simjob.read_state(self.folder)["state"], "stopped")
+        self.assertEqual(simulation.load(self.folder / simjob.STATE)["state"], "stopped")
+        with mock.patch.object(simjob, "_procs", {}), \
+                mock.patch.object(simjob.subprocess, "Popen", return_value=mock.Mock(pid=12345)) as spawn:
+            accepted, state = simjob.start(self.folder, {"id": "new", "label": "새 계산"})
+            self.assertTrue(accepted)
+            self.assertEqual(state["id"], "new")
+            spawn.assert_called_once()
+
     def test_concurrent_start_requests_launch_only_one_process(self):
         competing_reads = threading.Barrier(2)
         load = simulation.load
@@ -1708,11 +1785,17 @@ class ReportTest(TempDbTest):
                          ["1억원", "9,500만원", "1억 2,000만원", "3,500원", "0.25원"])
         self.db.set_state("markets", {"list": [{"market": "KRW-BTC", "name": "비트코인"}, {"market": "KRW-DOGE", "name": "도지코인"}]})
         self.assertIn("못 찾았어요", alerts.command("/알림 NOPE 1억", self.db)[0])
-        with mock.patch.object(alerts.upbit, "get_prices", return_value={"KRW-BTC": 95_000_000}):
+        # 시간이 같고 DB 키 정렬이 등록 순서의 역순이어도 등록한 순서대로 표시한다.
+        with mock.patch.object(alerts.time, "time", return_value=1000), \
+                mock.patch.object(alerts.secrets, "token_hex", side_effect=["ffffff", "000000"]), \
+                mock.patch.object(alerts.upbit, "get_prices", return_value={"KRW-BTC": 95_000_000, "KRW-DOGE": 300}):
             self.assertIn("1억원 이상으로 오르면", alerts.command("/알림 BTC 1억", self.db)[0])
-        with mock.patch.object(alerts.upbit, "get_prices", return_value={"KRW-DOGE": 300}):
             self.assertIn("250원 이하로 내리면", alerts.command("/alert 도지코인 250", self.db)[0])
-        text, buttons = alerts.command("/알림", self.db)
+        reopened = Database(self.path, create=False)
+        try:
+            text, buttons = alerts.command("/알림", reopened)
+        finally:
+            reopened.close()
         self.assertIn("가격 알림 2개", text)
         self.assertEqual(buttons[0][0], "🗑 비트코인 1억원 이상")
         self.assertEqual(alerts.due(self.db, {"KRW-BTC": 99_000_000, "KRW-DOGE": 260}), [])   # 아직

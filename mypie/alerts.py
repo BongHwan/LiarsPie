@@ -14,6 +14,7 @@ from .db import Database
 from .timeutil import ts
 
 PREFIX = "price_alert:"
+SEQUENCE_KEY = "price_alert_sequence"
 DELETE = "alert:del:"  # 지우기 버튼을 누르면 봇에게 오는 값의 앞부분
 MAX_ALERTS = 20
 USAGE = ("🔔 가격 알림 쓰는 법\n"
@@ -52,7 +53,13 @@ def find_market(word: str, markets: list[dict]) -> dict | None:
 
 def alerts(db: Database) -> list[tuple[str, dict]]:
     """걸어 둔 알림 (먼저 건 것부터): [(DB 키, 알림)]."""
-    return sorted(db.states(PREFIX), key=lambda kv: kv[1].get("made", 0))
+    def order(item):
+        alert = item[1]
+        if "sequence" in alert:
+            return 1, alert["sequence"]
+        return 0, alert.get("made", 0)
+
+    return sorted(db.states(PREFIX), key=order)
 
 
 def _name(a: dict) -> str:
@@ -92,7 +99,13 @@ def command(text: str, db: Database) -> tuple[str, list | None] | None:
         return "지금 가격을 받지 못했어요. 잠시 뒤에 다시 해 주세요.", None
     alert = {"market": market["market"], "name": market.get("name") or market["market"], "price": price,
              "up": price > now, "set_at": ts(), "made": time.time()}
-    db.set_state(PREFIX + secrets.token_hex(3), alert)
+    with db.transaction(immediate=True):
+        if len(alerts(db)) >= MAX_ALERTS:
+            return f"알림은 {MAX_ALERTS}개까지예요. /알림 에서 몇 개 지우고 다시 걸어 주세요.", None
+        sequence = db.get_state(SEQUENCE_KEY, 0) + 1
+        alert["sequence"] = sequence
+        db.set_state(PREFIX + secrets.token_hex(3), alert)
+        db.set_state(SEQUENCE_KEY, sequence)
     return (f"🔔 {alert['name']}이(가) {won_text(price)} {'이상으로 오르면' if alert['up'] else '이하로 내리면'} "
             f"한 번 알려드릴게요.\n지금 {won_text(now)} · 목록은 /알림"), None
 

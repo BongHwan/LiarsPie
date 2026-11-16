@@ -18,6 +18,7 @@
     그 번호로 업비트에 물어서 체결됐으면 장부에 반영하게 하고, 안 들어갔으면 지운다.
 """
 
+import hashlib
 import math
 import uuid
 
@@ -330,6 +331,9 @@ class LiveExecutor:
     def clear_pending(self) -> None:
         self.db.delete_state(self.PENDING_KEY)
 
+    def _key_fingerprint(self) -> str:
+        return hashlib.sha256(self.client.access_key.encode("utf-8")).hexdigest()
+
     def _balance(self, currency: str) -> float:
         try:
             return self.client.balance(currency)
@@ -340,7 +344,8 @@ class LiveExecutor:
         """주문을 내고 체결이 끝날 때까지 기다린다. 결과를 모르게 되면 OrderUnknown (표시는 남겨 둔다)."""
         identifier = f"mypie-{uuid.uuid4()}"
         self.db.set_state(self.PENDING_KEY, {**note, "identifier": identifier, "side": params["side"],
-                                             "market": params["market"], "at": ts()})
+                                             "market": params["market"], "at": ts(),
+                                             "key_fingerprint": self._key_fingerprint()})
         try:
             placed = self.client.place_order({**params, "identifier": identifier})
         except OrderRejected:
@@ -387,15 +392,26 @@ class LiveExecutor:
         pending = self.pending()
         if not pending:
             return None
+        fingerprint = pending.get("key_fingerprint")
+        if fingerprint and fingerprint != self._key_fingerprint():
+            raise OrderUnknown("미확정 주문을 제출할 때 사용한 업비트 API 키와 현재 키가 달라요. "
+                               "원래 키로 돌아가 주문을 확인해 주세요")
         try:
             order = self.client.get_order(identifier=pending["identifier"])
-            if order.get("state") not in ("done", "cancel"):
-                order = self.client.wait_order(order["uuid"])
         except UpbitError as e:
             if e.status == 404 or e.name == "order_not_found":
+                if not fingerprint:
+                    raise OrderUnknown("이전 버전의 미확정 주문이라 제출에 사용한 업비트 키를 확인할 수 없어요. "
+                                       "업비트 주문 내역을 확인해 주세요") from e
                 self.clear_pending()
                 return {"pending": pending, "fill": None}
             raise OrderNotPlaced(f"끊기기 전 주문을 확인하는 중 ({e})", status=e.status, name=e.name) from e
+        if order.get("state") not in ("done", "cancel"):
+            try:
+                order = self.client.wait_order(order["uuid"])
+            except UpbitError as e:
+                raise OrderUnknown(f"접수된 주문의 체결 결과를 확인하지 못했어요 ({e})",
+                                   status=e.status, name=e.name) from e
         volume, funds = _filled(order)
         if volume <= 0:
             self.clear_pending()

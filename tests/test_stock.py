@@ -552,6 +552,32 @@ class StockBotTest(TempDb):
         bot.step(at(DAY2, "09:04"))
         self.assertFalse(self.results()[-1][0])                          # 너무 작은 손절선은 받지 않는다
 
+    def test_recovered_stop_loss_keeps_buy_signal_blocked(self):
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot("live")
+        self.request(1, action="add", symbol=self.SYMBOL, strategy="buy_and_hold", amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        bot.step(at(DAY1, "09:01"))
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy"])
+
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        with mock.patch.object(self.toss, "order", side_effect=toss.TossError("체결 조회 중 통신 단절")):
+            with self.assertRaises(toss.OrderUnknown):
+                bot.step(at(DAY1, "10:00"))
+        self.assertEqual(len(self.trades()), 1)
+        self.assertEqual(bot.executor.pending()["stop_state"], {"last_stop_day": DAY1, "cut": True})
+
+        restarted = self.make_bot("live")
+        self.toss.set(self.SYMBOL, DAY2, 95_000)
+        restarted.step(at(DAY2, "09:01"))
+        restarted.step(at(DAY2, "09:02"))
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy", "sell"])
+        self.assertEqual(len(self.toss.placed), 2)
+        self.assertIsNone(restarted.executor.pending())
+        state = restarted._sstate(restarted.slots[0])
+        self.assertTrue(state["cut"])
+        self.assertEqual(state["last_stop_day"], DAY1)
+
     def test_orders_use_the_book_at_that_moment_and_keep_the_planned_price(self):
         """주문은 그 순간의 호가로 (살 때 가장 싼 매도 호가, 팔 때 가장 비싼 매수 호가). 계획 가격과 함께 적어서 체결 오차를 본다."""
         self.toss.set(self.SYMBOL, DAY1, 100_000)

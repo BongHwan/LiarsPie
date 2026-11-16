@@ -516,12 +516,11 @@ class Bot:
         if self._holding(slot, price):
             loss = self._loss_line(slot)  # 손절선은 산 직후에도 지킨다
             if loss is not None and price <= loss:
-                self._sell(slot, price, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈")
-                self._set_sstate(slot.id, last_stop_day=bar, cut=True)
+                self._sell(slot, price, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈",
+                           stop_state={"last_stop_day": bar, "cut": True})
                 return
             if plan.sell_stop is not None and st.get("last_buy_day") != bar and price <= plan.sell_stop:
-                self._sell(slot, price, f"{plan.sell_stop:,.0f}원 이탈")
-                self._set_sstate(slot.id, last_stop_day=bar)
+                self._sell(slot, price, f"{plan.sell_stop:,.0f}원 이탈", stop_state={"last_stop_day": bar})
                 return
         elif (plan.buy_stop is not None and price >= plan.buy_stop
               and st.get("last_buy_day") != bar and st.get("last_stop_day") != bar):
@@ -557,16 +556,24 @@ class Bot:
                            f"({trade['krw']:,.0f}원) · {reason}", notify=True)
         return True
 
-    def _sell(self, slot: Slot, price: float, reason: str) -> bool:
+    def _sell(self, slot: Slot, price: float, reason: str, *, stop_state: dict | None = None) -> bool:
         coin = self.book.slot(slot.id)["coin"]
-        fill = self.executor.sell(slot.market, coin, price, {"slot": slot.id, "reason": reason})
+        note = {"slot": slot.id, "reason": reason}
+        if stop_state:
+            note["stop_state"] = stop_state
+        fill = self.executor.sell(slot.market, coin, price, note)
         if fill is None:
-            self.book.clear_dust(slot.id)
+            with book_transaction(self.book):
+                self.book.clear_dust(slot.id)
+                if stop_state:
+                    self._set_sstate(slot.id, **stop_state)
             self.event("info", f"{self._tag(slot)}최소 주문 금액보다 적은 자투리라 장부에서만 정리했어요")
             return True
         with book_transaction(self.book):
             trade = self.book.apply_sell(slot.id, *fill, reason)
             self.db.add_trade(self.executor.mode, slot.market, trade)
+            if stop_state:
+                self._set_sstate(slot.id, **stop_state)
             self.executor.clear_pending()
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
         self.event("info", f"🔵 {self._tag(slot)}매도 {trade['volume']:.8g} @ {trade['price']:,.0f}원 · "
@@ -595,6 +602,8 @@ class Bot:
                 self.db.add_trade(self.executor.mode, market, trade)
                 if pending["side"] == "bid" and pending.get("day"):
                     self._set_sstate(slot_id, last_buy_day=pending["day"], cut=False)
+                elif pending["side"] == "ask" and pending.get("stop_state"):
+                    self._set_sstate(slot_id, **pending["stop_state"])
                 self.executor.clear_pending()
             self.event("warning", f"[실거래] 끊기기 전에 낸 {market} {side} 주문이 체결돼 있어서 장부에 반영했어요 "
                                   f"({volume:.8g} @ {funds / volume:,.0f}원)", notify=True)
