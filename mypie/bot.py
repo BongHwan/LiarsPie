@@ -24,19 +24,22 @@ import subprocess
 import threading
 import time
 from dataclasses import asdict
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import timedelta
 
-from . import alerts, auth, backtest, buyhold, network, reports, sshwatch, stoploss, telegram, timeframes, upbit
+from . import alerts, auth, backtest, buycontrol, buyhold, network, order_recovery, reports, sshwatch, stoploss, telegram, timeframes, upbit
 from .broker import MIN_ORDER_KRW, Book, LiveExecutor, PaperExecutor, migrate_book, new_slot_id
+from .botlock import bot_lock
 from .config import load_config
 from .db import Database
+from .health import record_success
 from .history import sync_candles
 from .keys import days_left, env_stamp, expired_text, expiring_text, load_keys
 from .strategies import STRATEGIES, DayPlan, create_strategy, strategy_params
 from .strategies.combo import check_rule, make_rule, normalize_rule, rule_label
 from .timeframes import bar_key, next_bar
 from .timeutil import KST, now_kst, trading_day, ts
+from .tradelimits import BuyLimits, record_order
 from .vault import VaultError, book_transaction
 
 log = logging.getLogger("mypie.bot")
@@ -112,6 +115,7 @@ class Bot:
         if type(ratio) not in (int, float) or not 0 <= ratio <= 1:
             raise ValueError("[order].invest_ratio는 0 이상 1 이하의 숫자여야 해요")
         self.invest_ratio = ratio
+        self.buy_limits = BuyLimits.from_config(cfg.get("order", {}))
         self.backtest_days = int(cfg["backtest"]["days"])
         self.rank_by = cfg["backtest"]["rank_by"]
 
@@ -277,6 +281,10 @@ class Bot:
                         self._reboot(creds)
                         continue
                     stock_db, view = self.cfg["stock"]["db_path"], reports.view_of(text)
+                    buy_reply = buycontrol.telegram_command(text, db, stock_db)
+                    if buy_reply is not None:
+                        telegram.send(buy_reply, creds)
+                        continue
                     if view:  # /상태 · /주식 · /신호 · /파이: 아래 버튼으로 같은 메시지에서 바꿔 본다
                         telegram.send(reports.view_text(view, db, stock_db), creds, reports.view_buttons(view))
                         continue
@@ -438,6 +446,7 @@ class Bot:
         if self.key_day != day:
             self._update_key_info(day)
         self._update_rankings(day)
+        record_success(self.db)
 
     def _bar(self, slot: Slot) -> str:
         """그 줄의 판단 주기에서 지금 진행 중인 봉의 키. 일봉이면 거래일(YYYY-MM-DD)."""
@@ -484,7 +493,11 @@ class Bot:
                 self._set_sstate(s.id, cut=False)
             # 방금 판 줄은 같은 봉 시작에 다시 사지 않는다 (살 때·팔 때 조합에서 사자·팔자가 같이 켜진 경우. 시뮬레이션과 같은 규칙)
             if s.id not in sold and not cut and not self._holding(s, prices[s.market]) and s.plan.buy_at_open:
-                self._buy(s, prices[s.market], bars[s.id], f"매수 신호 · {s.plan.note}")
+                try:
+                    self._buy(s, prices[s.market], bars[s.id], f"매수 신호 · {s.plan.note}")
+                except buycontrol.BuyPaused:
+                    # 주문 준비 도중 정지된 경우도 같은 봉에서 다시 판단한다.
+                    continue
             self._set_sstate(s.id, open_done_day=bars[s.id])  # 재시작해도 봉 시작 매매를 두 번 하지 않게
 
     def _loss_line(self, slot: Slot) -> float | None:
@@ -524,7 +537,10 @@ class Bot:
                 return
         elif (plan.buy_stop is not None and price >= plan.buy_stop
               and st.get("last_buy_day") != bar and st.get("last_stop_day") != bar):
-            self._buy(slot, price, bar, f"{plan.buy_stop:,.0f}원 돌파")
+            try:
+                self._buy(slot, price, bar, f"{plan.buy_stop:,.0f}원 돌파")
+            except buycontrol.BuyPaused:
+                return
 
     # ---- 주문 ----
     # 주문 오류는 그대로 위로 올려 보낸다. 루프가 잠시 기다렸다 다시 시도하고,
@@ -538,6 +554,8 @@ class Bot:
 
     def _buy(self, slot: Slot, price: float, day: str, reason: str) -> bool:
         """그 계좌 원화로만 산다. 원화가 없는 계좌는 지켜보기만 한다."""
+        if buycontrol.paused(self.db):
+            raise buycontrol.BuyPaused
         amount = self._buy_budget(slot)
         if amount < self._min_buy_budget():
             if amount > 0 and (slot.id, day) not in self.warned:
@@ -545,11 +563,21 @@ class Bot:
                 self.event("warning", f"{self._tag(slot)}매수 신호가 났지만 매수 예산 {amount:,.0f}원이 "
                                       f"최소 필요 금액({self._min_buy_budget():,.2f}원)보다 적어요 · 금고에서 더 넣어 주세요")
             return False
+        exposure = sum(s["cost"] for s in self.book.data["slots"].values() if s["market"] == slot.market)
+        amount, blocked = self.buy_limits.budget(self.db, self.executor.mode, amount, exposure, self._min_buy_budget())
+        if blocked:
+            key = (slot.market, now_kst().date(), blocked)
+            if key not in self.warned:
+                self.warned.add(key)
+                self.event("warning", f"{self._tag(slot)}신규 매수 중단 · {blocked}", notify=True)
+            return False
         note = {"slot": slot.id, "reason": reason, "day": day}
         volume, funds, fee = self.executor.buy(slot.market, amount, price, note)
         with book_transaction(self.book):
             trade = self.book.apply_buy(slot.id, volume, funds, fee, reason)
             self._set_sstate(slot.id, last_buy_day=day, cut=False)
+            if self.executor.mode == "paper":
+                record_order(self.db, "paper")
             self.db.add_trade(self.executor.mode, slot.market, trade)
             self.executor.clear_pending()
         self.event("info", f"🔴 {self._tag(slot)}매수 {trade['volume']:.8g} @ {trade['price']:,.0f}원 "
@@ -571,6 +599,8 @@ class Bot:
             return True
         with book_transaction(self.book):
             trade = self.book.apply_sell(slot.id, *fill, reason)
+            if self.executor.mode == "paper":
+                record_order(self.db, "paper")
             self.db.add_trade(self.executor.mode, slot.market, trade)
             if stop_state:
                 self._set_sstate(slot.id, **stop_state)
@@ -581,7 +611,7 @@ class Bot:
         return True
 
     def _recover(self) -> None:
-        result = self.executor.recover()
+        result = order_recovery.recover(self.db, LiveExecutor.PENDING_KEY, self.executor.recover)
         if not result:
             return
         pending = result["pending"]
@@ -1115,16 +1145,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
     log.info("설정 파일: %s", cfg["_path"] or "(기본값)")
-    bot = Bot(cfg, Database(cfg["general"]["db_path"]))
-
-    if args.once:
-        bot.step()
-        print(json.dumps(bot.db.get_state("status"), ensure_ascii=False, indent=2))
-        return
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: bot.stop_event.set())
-    bot.run()
+    path = cfg["general"]["db_path"]
+    with bot_lock(path), closing(Database(path)) as db:
+        bot = Bot(cfg, db)
+        if args.once:
+            bot.step()
+            print(json.dumps(db.get_state("status"), ensure_ascii=False, indent=2))
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: bot.stop_event.set())
+        bot.run()
 
 
 if __name__ == "__main__":

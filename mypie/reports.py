@@ -15,6 +15,7 @@ HELP = ("🐜 AntLab 명령어\n"
         "/신호 (/signal) — 계좌마다 전략이 지금 🔴 사자인지 🔵 팔자인지\n"
         "/파이 (/pi) — 라즈베리파이 온도·CPU·메모리·전력\n"
         "/알림 BTC 1억 (/alert) — 가격에 닿으면 알려 주기 (/알림 만 보내면 목록)\n"
+        "/pausebuy coin 또는 stock — 신규 매수 일시정지 · /resumebuy로 재개\n"
         "/재부팅 (/reboot) — 라즈베리파이 재부팅 (뒤에 '확인'을 붙여야 해요)\n"
         "/차단목록 (/blocked) — SSH 알림의 '막기' 버튼으로 막은 IP\n"
         "/차단해제 IP (/unblock) — 막은 IP 풀기\n"
@@ -27,6 +28,8 @@ COMMANDS = {  # 텔레그램 메뉴에 보일 영어 명령 (한글 명령도 �
     "signal": "전략마다 지금 사자·팔자",
     "pi": "라즈베리파이 온도·CPU·전력",
     "alert": "가격 알림 (예: /alert BTC 1억)",
+    "pausebuy": "신규 매수 일시정지 (뒤에 coin 또는 stock)",
+    "resumebuy": "신규 매수 재개 (뒤에 coin 또는 stock)",
     "reboot": "라즈베리파이 재부팅 (뒤에 '확인')",
     "blocked": "SSH 때문에 막은 IP 목록",
     "unblock": "막은 IP 풀기 (뒤에 IP)",

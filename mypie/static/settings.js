@@ -160,6 +160,7 @@
     u.confirmRow = node('label', { class: 'check', hidden: '' }, u.confirm, ' 실제 돈으로 주문이 나간다는 걸 이해했어요');
     u.pin = pinInput();
     u.go = node('button', { type: 'button', class: 'primary', disabled: '', text: '계좌 바꾸기' });
+    u.pause = node('button', { type: 'button', disabled: '', text: '신규 매수 일시정지' });
     u.msg = node('p', { class: 'msg' });
     // 🔑 키 넣기 · 바꾸기: 넣은 키는 다시 화면에 보이지 않는다
     const k = a.keys, b = (text) => node('b', { text });
@@ -179,7 +180,8 @@
     panel.append(node('section', { class: 'set-sec', id: kind === 'coin' ? 'setCoin' : 'setStock' },
       node('h3', {}, a.title + ' ', node('small', { text: '모의투자와 실거래는 금고·계좌를 따로 써요 · 바꿔도 아무것도 팔지 않아요' }), u.chip),
       node('div', { class: 'field' }, node('div', { class: 'seg big', role: 'group', 'aria-label': a.title }, u.paper, u.live), u.key),
-      node('p', { class: 'hint', text: a.hint }), u.confirmRow, node('div', { class: 'actions' }, u.pin, u.go), u.msg, u.keyBox));
+      node('p', { class: 'hint', text: a.hint }), u.confirmRow,
+      node('div', { class: 'actions' }, u.pin, u.go, u.pause), u.msg, u.keyBox));
     const keySay = (text, cls) => { u.keyMsg.textContent = text; u.keyMsg.className = 'msg ' + (cls || ''); };
     u.keySave.onclick = async () => {
       const body = { broker: k.broker, pin: u.keyPin.value };
@@ -208,6 +210,22 @@
     };
     u.paper.onclick = () => { st.pick[kind] = 'paper'; renderAccount(kind); };
     u.live.onclick = () => { st.pick[kind] = 'live'; renderAccount(kind); };
+    u.pause.onclick = async () => {
+      const d = st.data[kind];
+      if (!d || typeof d.buy_paused !== 'boolean') return;
+      if (!u.pin.value) { say('PIN을 넣어 주세요', 'bad'); u.pin.focus(); return; }
+      u.pauseBusy = true;
+      u.pause.disabled = true;
+      try {
+        const r = await post(a.control, { action: d.buy_paused ? 'resume_buy' : 'pause_buy', pin: u.pin.value });
+        say(r.message, r.ok ? 'ok' : 'bad');
+        if (r.ok) {
+          u.pin.value = '';
+          await refresh();
+        }
+      } catch (e) { say('요청을 보내지 못했어요. 파이 연결을 확인해 주세요.', 'bad'); }
+      finally { u.pauseBusy = false; renderAccount(kind); }
+    };
     u.go.onclick = async () => {
       const d = st.data[kind], now = d && d.status && d.status.mode, want = st.pick[kind];
       if (!now || !want || want === now) return;
@@ -228,6 +246,8 @@
   function renderAccount(kind) {
     const a = ACCOUNTS[kind], u = ui[kind], d = st.data[kind];
     const now = d && d.status && d.status.mode;
+    u.pause.disabled = !!u.pauseBusy || !d || typeof d.buy_paused !== 'boolean';
+    u.pause.textContent = d && d.buy_paused ? '신규 매수 재개' : '신규 매수 일시정지';
     const coin = st.data.coin, ip = ((coin && coin.status && coin.status.network) || {}).ip;
     u.ip.textContent = ip ? `(${ip})` : '(공유기 관리 화면의 외부 IP)';
     const hasKey = d && (kind === 'coin' ? d.live_ready : d.keys);
@@ -239,6 +259,7 @@
     }
     const want = st.pick[kind] || now;
     u.chip.textContent = now === 'live' ? '🔴 지금 실거래' : '🧪 지금 모의투자';
+    if (d.buy_paused) u.chip.textContent += ' · 신규 매수 정지 중';
     u.chip.className = 'chip ' + (now === 'live' ? 'live' : 'paper');
     u.paper.setAttribute('aria-pressed', String(want === 'paper'));
     u.live.setAttribute('aria-pressed', String(want === 'live'));

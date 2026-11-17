@@ -157,6 +157,38 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 - [ ] 집 밖에서 보려고 포트를 열었다면 [8번](#8-집-밖에서-보기-선택)의 주의사항 지키기
 - [ ] `.env`, `data/`, `config.toml`, `deploy.local.ps1`은 다른 사람에게 주지 않기 (깃허브에도 안 올라가게 되어 있어요)
 
+## 같은 장부로 봇을 중복 실행하는 경우
+
+매매 봇은 장부 옆의 `.bot.lock` 파일에 운영체제 잠금을 잡아요. 같은 장부로 두 번째 봇을 실행하면 장부를 열거나 주문하기 전에 종료돼요. 첫 번째 봇이 종료되면 잠금은 자동으로 풀려요. Docker에서 같은 장부를 여러 컨테이너에 연결할 때도 장부 파일만 따로 연결하지 말고, 잠금 파일을 공유하도록 장부가 있는 디렉터리 전체를 같은 볼륨에서 연결하세요.
+
+## 봇 중단 알림
+
+별도 PC나 서버에서 AntLab 상태 감시를 실행하면 봇이 멈추거나 AntLab 서버에 접속할 수 없을 때 텔레그램으로 알림을 받아요.
+
+1. 감시 기기에 이 저장소와 Python 3.11 이상을 준비해요. 감시 기기에서 AntLab 웹 주소에 접속할 수 있어야 해요. 같은 LAN이나 VPN을 사용할 수 있어요.
+2. 감시 기기의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` 환경 변수를 설정하거나, 감시 기기의 저장소에서 `python3 -m mypie.telegram`으로 알림용 봇을 별도로 연결해요.
+3. 감시 기기에서 저장소 폴더를 열고 아래 명령을 실행해요. 예시 주소는 실제 AntLab 웹 주소로 바꿔 주세요. 계속 감시하려면 명령을 감시 기기의 시작 서비스로 등록해요.
+
+```bash
+python3 -m mypie.health http://192.168.0.10:8000 --interval 60 --stale-after 600
+```
+
+기본값은 60초마다 확인하고, 코인·주식 봇의 마지막 정상 실행이 10분 이상 갱신되지 않거나 정상 실행 기록이 없으면 해당 봇을 알려요. 서버에 두 번 연속 접속하지 못하면 별도의 서버 알림을 보내요. 알림을 보낸 상태가 정상으로 돌아오면 복구 알림을 보내요. 휴장 중이나 토스증권 키 등록 전에도 주식 봇의 대기 루프가 정상 실행되면 실행 시각을 갱신해요.
+
+`/healthz/bots`는 로그인 없이 코인·주식의 마지막 정상 실행 시각만 반환해요. 단순 서버 확인용 `/healthz`는 그대로 사용할 수 있어요.
+
+## 자동 백업과 복구 확인
+
+라즈베리파이 설치 스크립트는 첫 실행 약 10분 뒤와 이후 매일 백업을 실행하도록 타이머를 등록해요. 코인·주식 SQLite 장부와 현재 사용하는 TOML 설정을 코인 장부 옆 `backups/` 폴더에 저장해요. 장부는 봇을 멈추지 않고 복사하고, 복사본을 다시 열어 SQLite 무결성 검사와 설정 읽기에 모두 성공한 뒤에만 완료로 기록해요. 마지막 성공 시각은 코인·주식 화면의 **파이** 탭에서 볼 수 있어요.
+
+수동으로 새 백업을 만들려면 `python3 -m mypie.backup`을 실행해요. 복구 전에 기존 백업을 다시 검사하려면 아래 명령의 경로를 실제 백업 폴더로 바꿔 실행해요.
+
+```bash
+python3 -m mypie.backup --verify data/backups/backup-날짜-시각-번호
+```
+
+키를 보관하는 `.env`는 이 백업에 포함되지 않아요. 백업은 자동으로 삭제되지 않으며 서버의 같은 디스크에 저장돼요. 서버 디스크 장애에 대비하려면 백업 폴더를 별도 저장소에도 보관하세요. Docker나 Windows에서 자동 실행하려면 해당 환경의 스케줄러에 수동 백업 명령을 등록해요.
+
 ## 10. 문제가 생기면
 
 | 증상 | 해 볼 것 |
@@ -181,7 +213,9 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ## 11. 지우기
 
 ```bash
-systemctl --user disable --now mypie-bot mypie-web mypie-stock
+systemctl --user disable --now mypie-bot mypie-web mypie-stock mypie-backup.timer
+systemctl --user stop mypie-backup.service
 rm ~/.config/systemd/user/mypie-*.service
+rm ~/.config/systemd/user/mypie-backup.timer
 rm -rf ~/My_Pie        # 키(.env)와 기록(data/)도 같이 지워져요
 ```

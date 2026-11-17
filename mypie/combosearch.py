@@ -18,13 +18,17 @@ from itertools import combinations
 
 from . import backtest, simulation, stoploss
 from .strategies import create_strategy
-from .strategies.combo import OP_TEXT, SHORT, Shadow, rule_label
+from .strategies.combo import OP_TEXT, SHORT, Shadow, make_rule, rule_label
 
 TOP = 6            # 섞을 단일 전략 수 (그 기간 순위 상위)
 KEEP = 30          # 계산 하나마다 남기는 조합 수 (화면은 앞의 몇 개만)
 RECENT = 5         # 코인·주식마다 저절로 남겨 두는 최근 계산 수
 SAVED = 50         # ⭐ 저장해 둘 수 있는 계산 수 (최근 것과 따로)
 MIN_BARS = 60      # 상장한 지 얼마 안 된 종목은 있는 만큼으로 계산하되, 이보다 짧으면 못 한다
+VALIDATION_FOLDS = 3
+MIN_VALIDATION_BARS = 120
+STRESS_FEE_MULTIPLIER = 2
+STRESS_SLIPPAGE = 0.001
 HOLD = "buy_and_hold"
 YEARS = (1, 2, 3, 5, 8)
 MAX_YEARS = {"15m": 2}  # 15분봉은 봉이 너무 많아(8년이면 28만 개) 파이 메모리·시간으로 2년까지
@@ -256,7 +260,7 @@ def search(candles: list[dict], bars: int, ctx: dict, workers: int = 1, progress
     results = _map(_combo, tasks, workers, tick("search", len(tasks)))
     _shared.clear()
     # 점수 순, 같으면 전략이 적은(단순한) 조합 먼저. 사고판 결과가 똑같은 조합은 맨 앞 하나만 남기고 몇 개인지 센다
-    ranked = sorted(results, key=lambda r: (-r[1]["score"], len(r[0][0]) + len(r[0][2])))
+    ranked = sorted(results, key=lambda r: (-r[1]["score"], len(r[0][0]) + len(r[0][2]), r[0]))
     label_of = lambda n: registry[n].label
     side = lambda names, op: f" {OP_TEXT[op]} ".join(label_of(n) for n in names)
     out, seen = [], {}
@@ -276,6 +280,50 @@ def search(candles: list[dict], bars: int, ctx: dict, workers: int = 1, progress
             "seconds": round(time.time() - started, 1)}
 
 
+def validate(candles: list[dict], bars: int, ctx: dict, workers: int = 1, progress=None) -> dict:
+    """앞쪽 자료로 고른 조합을 뒤의 겹치지 않는 구간에서 평가한다."""
+    if bars < MIN_VALIDATION_BARS:
+        return {"folds": [], "min_bars": MIN_VALIDATION_BARS}
+    start = len(candles) - bars
+    boundaries = [start + bars * n // (VALIDATION_FOLDS + 1) for n in range(VALIDATION_FOLDS + 2)]
+    folds = []
+    total = VALIDATION_FOLDS * 100
+    make = lambda n: create_strategy(n, ctx["params"][n], ctx["strategies"])
+    phases = {"prep": (0, 25), "sides": (25, 10), "search": (35, 60)}
+    for index, (test_start, test_end) in enumerate(zip(boundaries[1:-1], boundaries[2:])):
+        base = index * 100
+
+        def report(phase, done, count):
+            if progress:
+                offset, width = phases[phase]
+                progress("validate", base + offset + done * width // max(1, count), total)
+
+        ranked = search(candles[:test_start], test_start - start, ctx, workers, report)
+        winner = ranked["results"][0]
+        warmup = min(test_start, ctx["history"])
+        window = candles[test_start - warmup:test_end]
+
+        def evaluate(fee, slippage, offset):
+            result = backtest.simulate(
+                make_rule(winner["rule"], make), window, fee, warmup=warmup,
+                bars_per_year=ctx["per_year"], sell_cost=ctx["sell_cost"], stop_loss=ctx["stop_loss"],
+                tick=ctx.get("tick"), slippage=slippage, liquidate_end=test_end < len(candles),
+                progress=(lambda _: progress("validate", base + offset, total)) if progress else None)
+            return {k: result[k] for k in ("total_return", "mdd", "trades")}
+
+        folds.append({"train_from": candles[start]["day"], "train_to": candles[test_start - 1]["day"],
+                      "test_from": candles[test_start]["day"], "test_to": candles[test_end - 1]["day"],
+                      "label": winner["label"], "rule": winner["rule"], "train_return": winner["total_return"],
+                      "baseline": evaluate(ctx["fee"], 0.0, 95),
+                      "stress": evaluate(ctx["fee"] * STRESS_FEE_MULTIPLIER, STRESS_SLIPPAGE, 98)})
+        if progress:
+            progress("validate", base + 100, total)
+    return {"folds": folds, "boundary_liquidation": True,
+            "fee_multiplier": STRESS_FEE_MULTIPLIER, "slippage": STRESS_SLIPPAGE,
+            "baseline_return": math.prod(1 + f["baseline"]["total_return"] for f in folds) - 1,
+            "stress_return": math.prod(1 + f["stress"]["total_return"] for f in folds) - 1}
+
+
 def telegram_text(r: dict, rows: int = 5) -> str:
     """오래 걸린 계산이 끝나면 텔레그램으로 보내는 요약 (1~rows위)."""
     pct = lambda v: "-" if v is None else f"{v * 100:+,.1f}%"
@@ -291,6 +339,9 @@ def telegram_text(r: dict, rows: int = 5) -> str:
         lines.append(f"   {pct(x['total_return'])} · 낙폭 {pct(x['mdd'])} · 매매 {x['trades']}번" + (" · 👍 두 절반 다 이김" if steady else ""))
     if r.get("short"):
         lines.append(f"\n※ 상장한 지 얼마 안 돼서 {r['from']}부터 있는 만큼만 계산했어요 (참고만)")
+    validation = r.get("validation") or {}
+    if validation.get("folds"):
+        lines.append(f"\n선정 이후 구간 검증 · 기본 {pct(validation['baseline_return'])} · 비용 증가 {pct(validation['stress_return'])}")
     lines.append("\n더 보기: 웹페이지 🔍 좋은 조합 찾기")
     return "\n".join(lines)
 
@@ -314,4 +365,8 @@ def estimate(bars: int, n_strategies: int, workers: int, fetch_bars: int = 0) ->
     """대략 걸리는 시간(초): 전략 계산 + 조합 굴리기 + 모자란 봉 받기."""
     combos = (TOP + TOP * (TOP - 1)) ** 2
     prep = n_strategies * bars * simulation.SEC_PER_STEP
-    return (prep + combos * bars * SEC_PER_BAR) / max(1, workers) + fetch_bars / 200 * simulation.SEC_PER_FETCH
+    calc = (prep + combos * bars * SEC_PER_BAR) / max(1, workers)
+    if bars >= MIN_VALIDATION_BARS:
+        # 전체 탐색 외에 1/4, 2/4, 3/4 구간으로 다시 선정한다.
+        calc *= 2.5
+    return calc + fetch_bars / 200 * simulation.SEC_PER_FETCH

@@ -1,0 +1,9 @@
+[Unit]
+Description=My_Pie ledger and settings backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/My_Pie
+ExecStart=/usr/bin/python3 -m mypie.backup
+UMask=0077
+TimeoutStartSec=10min

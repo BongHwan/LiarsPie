@@ -28,6 +28,9 @@ from mypie import (alerts, auth, backtest, combosearch, curve, indicators, keys,
                    sshwatch, stoploss,
                    telegram, timeframes, toss, upbit, web)
 from mypie.bot import Bot, check_account
+from mypie import backup
+from mypie.botlock import bot_lock
+from mypie import health
 from mypie.broker import Book, LiveExecutor, PaperExecutor, migrate_book
 from mypie.config import DEFAULTS
 from mypie.db import Database
@@ -928,6 +931,80 @@ class BotFlowTest(TempDbTest):
         self.assertEqual(len(self.trades()), 2)
         self.assertIn("손절 뒤 쉬는 중", self.db.get_state("status")["slots"][0]["state_text"])
 
+    def test_buy_limits_combine_slots_for_one_market(self):
+        self.cfg["order"]["max_symbol_krw"] = 90_000
+        self.accounts(*((sid, "KRW-BTC", "buy_and_hold", 60_000) for sid in ("a", "b", "c")))
+        self.btc(self.D1, 100)
+        bot = self.make_bot()
+        self.go(bot, self.D1)
+        self.assertEqual([t["krw"] for t in self.db.trades("paper")], [60_000, 30_000])
+        self.assertEqual(bot.book.slot("c")["krw"], 60_000)
+        self.assertTrue(any("종목별 최대 투자금" in e["message"] for e in self.db.recent_events()))
+
+    def test_daily_loss_limit_stays_blocked_after_later_profit_until_next_day(self):
+        from mypie import tradelimits
+
+        self.cfg["order"]["daily_loss_krw"] = 10_000
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000))
+        for profit in (-10_000, 20_000):
+            self.db.add_trade("paper", "KRW-ETH", {"side": "sell", "price": 100, "volume": 1,
+                                                   "krw": 100, "fee": 0, "profit": profit})
+        bot = self.make_bot()
+        self.assertFalse(bot._buy(bot.slots[0], 100, self.D1, "테스트"))
+        self.assertTrue(any("실현 손실 한도" in e["message"] for e in self.db.recent_events()))
+        tomorrow = (datetime.now(KST).date() + timedelta(days=1)).isoformat()
+        with mock.patch.object(tradelimits, "_today", return_value=tomorrow):
+            self.assertTrue(bot._buy(bot.slots[0], 100, self.D2, "테스트"))
+
+    def test_pause_during_balance_check_leaves_open_buy_available_in_same_bar(self):
+        from mypie import buycontrol
+
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000), mode="live")
+        self.btc(self.D1, 100)
+        bot = self.make_bot()
+        get_balance = self.client.balance
+
+        def pause_during_balance(currency):
+            balance = get_balance(currency)
+            buycontrol.set_paused(self.db, True)
+            return balance
+
+        with mock.patch.object(self.client, "balance", side_effect=pause_during_balance):
+            self.go(bot, self.D1)
+        self.assertEqual(self.client.attempts, 0)
+        self.assertIsNone(bot.executor.pending())
+        self.assertIsNone(bot._sstate(bot.slots[0]).get("open_done_day"))
+
+        buycontrol.set_paused(self.db, False)
+        self.go(bot, self.D1, steps=2)
+        self.assertEqual(self.client.attempts, 1)
+        self.assertEqual(self.trades(), [("buy", "KRW-BTC")])
+        self.assertEqual(bot._sstate(bot.slots[0])["open_done_day"], self.D1)
+
+    def test_buy_pause_persists_and_allows_recovery_and_stop_loss(self):
+        self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000, {"stop_loss": 10}), mode="live")
+        self.btc(self.D1, 100)
+        self.db.set_state(pin.STATE_KEY, pin.make("2468"))
+        self.assertEqual(web.request_coin(self.path, {"action": "pause_buy", "pin": "2468"})[0], 200)
+        bot = self.make_bot()
+        self.go(bot, self.D1)
+        self.assertEqual(self.client.attempts, 0)
+        self.assertTrue(web.build_payload(self.path)["buy_paused"])
+
+        self.assertEqual(web.request_coin(self.path, {"action": "resume_buy", "pin": "2468"})[0], 200)
+        self.client.fail_wait = True
+        self.go(bot, self.D1, errors_ok=True)
+        self.assertIsNotNone(bot.executor.pending())
+        self.assertEqual(web.request_coin(self.path, {"action": "pause_buy", "pin": "2468"})[0], 200)
+        self.client.fail_wait = False
+        restarted = self.make_bot()
+        self.go(restarted, self.D1)
+        self.assertEqual(self.trades(), [("buy", "KRW-BTC")])
+        self.btc(self.D1, 89)
+        self.go(restarted, self.D1)
+        self.assertEqual(self.trades(), [("buy", "KRW-BTC"), ("sell", "KRW-BTC")])
+        self.assertIsNone(restarted.executor.pending())
+
     def test_recovered_stop_loss_keeps_buy_signal_blocked(self):
         self.accounts(("a", "KRW-BTC", "buy_and_hold", 100_000, {"stop_loss": 10}), mode="live")
         bot = self.make_bot()
@@ -1415,6 +1492,29 @@ class LongSimulationTest(TempDbTest):
                 "bars": 1095, "rule": rule, "stop_loss": stop, "base_key": base, "combo_key": combo, "label": "ETH 3년",
                 "workers": 2}  # 리눅스(파이)에서는 CPU 둘에 나눠서, 윈도에서는 한 프로세스에서
 
+    def test_walk_forward_selects_from_past_only_and_compares_costs(self):
+        candles = [candle(f"d{i:04d}", 100, 100, 100, 100) for i in range(180)]
+        ctx = simulation.context("coin", self.cfg, "1d", 0)
+        candidate = {"label": "검증용 전략", "rule": normalize_rule({"strategy": "buy_and_hold"}), "total_return": 0.1}
+        seen = []
+
+        def select(training, bars, *_):
+            seen.append((training[-1]["day"], bars))
+            return {"results": [candidate]}
+
+        with mock.patch.object(combosearch, "search", side_effect=select):
+            result = combosearch.validate(candles, 120, ctx)
+        self.assertEqual(seen, [("d0089", 30), ("d0119", 60), ("d0149", 90)])
+        self.assertEqual([(f["test_from"], f["test_to"]) for f in result["folds"]],
+                         [("d0090", "d0119"), ("d0120", "d0149"), ("d0150", "d0179")])
+        self.assertTrue(all(f["train_to"] < f["test_from"] for f in result["folds"]))
+        self.assertTrue(result["boundary_liquidation"])
+        self.assertEqual([f["stress"]["trades"] for f in result["folds"]], [1, 1, 0])
+        fee = ctx["fee"]
+        self.assertAlmostEqual(result["baseline_return"], (1 - fee) ** 2 / (1 + fee) ** 3 - 1)
+        self.assertAlmostEqual(result["stress_return"], ((1 - 2 * fee) * 0.999) ** 2 / ((1 + 2 * fee) * 1.001) ** 3 - 1)
+        self.assertEqual(combosearch.validate(candles, 119, ctx)["folds"], [])
+
     def test_combo_search_uses_full_history_for_52_week_high(self):
         bars = [candle(f"d{i:04d}", 100 + i, 101 + i, 99 + i, 100 + i) for i in range(320)]
         ctx = simulation.context("stock", self.cfg, "1d", 0)
@@ -1462,6 +1562,7 @@ class LongSimulationTest(TempDbTest):
         page = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"]})
         self.assertEqual([h["id"] for h in page["history"]], [spec["id"] + "3", spec["id"] + "2"])  # 최근 것부터, 정한 개수까지
         self.assertEqual((page["result"]["id"], page["result"]["bars"]), (spec["id"] + "3", 1095))
+        self.assertEqual(len(page["result"]["validation"]["folds"]), 3)
         self.assertIn("좋은 조합 찾기 끝 · 이더리움 일봉 3년", combosearch.telegram_text(page["result"]))
         older = web.build_search(self.path, "/no/such.db", self.cfg, {"kind": ["coin"], "id": [spec["id"] + "2"]})
         self.assertEqual(older["result"]["id"], spec["id"] + "2")
@@ -1822,6 +1923,92 @@ class ReportTest(TempDbTest):
         self.assertIn("아침 리포트", sent[0])
 
 
+class BackupTest(TempDbTest):
+    def test_backups_include_live_sqlite_data_and_only_report_verified_success(self):
+        stock_path = Path(self.tmp.name) / "active-stock.db"
+        config = Path(self.tmp.name) / "active.toml"
+        config.write_text('[general]\nmode = "live"\n', encoding="utf-8")
+        cfg = {"general": {"db_path": self.path}, "stock": {"db_path": str(stock_path)}, "_path": str(config)}
+        stock = Database(stock_path)
+        try:
+            self.db.set_state("book:live", {"vault": 100})
+            stock.set_state("book:live", {"vault": 200})
+            self.assertIsNone(backup.last_success(self.path))
+            snapshot = backup.create(cfg)
+            backup.verify(snapshot)
+            stamp = backup.last_success(self.path)
+            self.assertIsNotNone(stamp)
+            for name, cash in (("mypie.db", 100), ("stock.db", 200)):
+                db = Database(snapshot / name, create=False)
+                try:
+                    self.assertEqual(db.get_state("book:live"), {"vault": cash})
+                finally:
+                    db.close()
+            self.assertEqual((snapshot / "config.toml").read_bytes(), config.read_bytes())
+            config.write_text("invalid =", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                backup.create(cfg)
+            self.assertEqual(backup.last_success(self.path), stamp)
+            self.assertEqual(list(backup.folder(self.path).glob("backup-*")), [snapshot])
+            (snapshot / "stock.db").write_bytes(b"broken database")
+            with self.assertRaises(backup.sqlite3.DatabaseError):
+                backup.verify(snapshot)
+        finally:
+            stock.close()
+
+
+class BotLockTest(unittest.TestCase):
+    def test_both_bot_entrypoints_refuse_a_locked_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            db = folder / "ledger.db"
+            config = folder / "test.toml"
+            config.write_text(f'[general]\ndb_path = "{db.as_posix()}"\n[stock]\ndb_path = "{db.as_posix()}"\n',
+                              encoding="utf-8")
+            env = {**os.environ, "MYPIE_CONFIG": str(config)}
+            holder = ("import sys\nfrom mypie.botlock import bot_lock\n"
+                      "with bot_lock(sys.argv[1]):\n print('locked', flush=True)\n sys.stdin.read()")
+            with subprocess.Popen([sys.executable, "-B", "-c", holder, str(db)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE) as first:
+                try:
+                    self.assertEqual(first.stdout.readline().strip(), b"locked")
+                    for module in ("mypie.bot", "mypie.stockbot"):
+                        with self.subTest(module=module):
+                            result = subprocess.run([sys.executable, "-B", "-X", "utf8", "-m", module, "--once"],
+                                                    env=env, capture_output=True, encoding="utf-8", timeout=5)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("이미 실행 중", result.stderr)
+                    self.assertFalse(db.exists())
+                    with bot_lock(str(folder / "other.db")):
+                        pass
+                finally:
+                    first.terminate()
+                    first.wait(timeout=5)
+            self.assertTrue(db.with_name("ledger.db.bot.lock").exists())
+            with bot_lock(str(db)):
+                pass
+
+
+class HealthTest(TempDbTest):
+    def test_monitors_each_bot_and_server_outage_independently(self):
+        sent = []
+        monitor = health.Monitor(600, sent.append)
+        monitor.check({"coin": 400, "stock": 1000}, 1000)
+        monitor.check({"coin": 400, "stock": 1000}, 1001)
+        monitor.check(None, 1002)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("코인 봇", sent[0])
+        monitor.check(None, 1003)
+        monitor.check(None, 1004)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("서버", sent[1])
+        monitor.check({"coin": 1005, "stock": None}, 1005)
+        self.assertEqual(len(sent), 5)
+        self.assertIn("서버", sent[2])
+        self.assertIn("코인 봇의 정상 실행", sent[3])
+        self.assertIn("주식 봇", sent[4])
+
+
 class WebLoginTest(TempDbTest):
     """진짜 웹 서버를 띄워서 텔레그램 코드 로그인 흐름을 확인한다."""
 
@@ -1854,6 +2041,18 @@ class WebLoginTest(TempDbTest):
                 return r.status, r.read().decode(), r.headers.get("Set-Cookie")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode(), None
+
+    def test_health_reports_both_heartbeats_without_login(self):
+        stock_path = str(Path(self.tmp.name) / "stock.db")
+        stock_db = Database(stock_path)
+        try:
+            self.db.set_state(health.HEARTBEAT, 1000)
+            stock_db.set_state(health.HEARTBEAT, 900)
+            with mock.patch.object(web.Handler, "stock_db_path", stock_path):
+                self.assertEqual(health.fetch_status(self.base), {"coin": 1000, "stock": 900})
+            self.assertEqual(self.request("/healthz")[0:2], (200, "ok"))
+        finally:
+            stock_db.close()
 
     def test_login_flow(self):
         self.assertEqual(self.request("/api/status")[0], 401)

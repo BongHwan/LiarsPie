@@ -14,6 +14,9 @@ name = "volatility_breakout"  # 처음 쓸 전략
 [order]
 invest_ratio = 1.0        # 코인 계좌 원화에서 매수 예산(수수료 포함)으로 쓸 비율 (0.5 = 절반, 0 = 매수 안 함)
 min_order_krw = 5000      # 업비트 최소 주문 금액
+daily_loss_krw = 0        # 코인 전체의 하루 실현 손실 한도 (원, 0이면 끔)
+max_symbol_krw = 0        # 코인 종목별 보유 원가와 신규 매수 예산의 합계 한도 (원, 0이면 끔)
+max_daily_orders = 0      # 코인 전체의 하루 주문 시도 횟수 한도 (0이면 끔)
 
 [paper]
 initial_krw = 1000000     # 모의투자 금고 시작 금액
@@ -37,6 +40,9 @@ mode = "paper"            # 처음 계좌 (웹페이지 ⚙️ 설정에서 바�
 paper_cash = 1000000      # 모의투자 금고 시작 금액
 fee_rate = 0.00015        # 매매 수수료 (사고팔 때)
 sell_tax = 0.002          # 증권거래세 (팔 때만)
+daily_loss_krw = 0        # 주식 전체의 하루 실현 손실 한도 (원, 0이면 끔)
+max_symbol_krw = 0        # 주식 종목별 보유 원가와 신규 매수 예산의 합계 한도 (원, 0이면 끔)
+max_daily_orders = 0      # 주식 전체의 하루 주문 시도 횟수 한도 (0이면 끔)
 interval_sec = 10         # 장중 확인 간격 (초)
 idle_sec = 60             # 장 밖 확인 간격 (초)
 backtest_days = 1095      # 전략 순위를 매길 과거 기간 (일)

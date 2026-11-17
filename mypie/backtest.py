@@ -29,13 +29,14 @@ PROGRESS_EVERY = 256  # 이만큼의 봉마다 진행률을 알린다 (오래 �
 
 def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: int = WARMUP,
              bars_per_year: float = 365, detail: bool = False, sell_cost: float = 0.0, stop_loss: float = 0.0,
-             progress=None, tick=None) -> dict:
+             progress=None, tick=None, *, slippage: float = 0.0, liquidate_end: bool = False) -> dict:
     """candles: 완성된 봉 (오래된 것 → 최신). 시작 자금 1로 계산한다. bars_per_year: 1년에 봉이 몇 개인지 (일봉 365).
     detail이면 줄이지 않은 자산 곡선과 매매 지점(fills: 몇 번째 봉에서 사고팔았나)도 돌려준다.
     stop_loss: 손절선 % (stoploss.py 규칙. 시작가에 산 봉에서도 지킨다).
     progress(done): 계산한 봉 수를 가끔 알린다. 예외를 올리면 계산을 멈춘다.
     tick(price): 호가 한 칸 (주식). 있으면 살 때는 한 칸 비싸게, 팔 때는 한 칸 싸게 체결됐다고 친다 (실제 주문처럼:
-    바로 체결되려면 반대편 호가에 사고팔아야 한다)."""
+    바로 체결되려면 반대편 호가에 사고팔아야 한다).
+    liquidate_end: 마지막 봉의 종가를 기준으로 남은 보유분을 매도한다."""
     cash, coin, cost = 1.0, 0.0, 0.0
     cut = False  # 손절 뒤 매수 신호가 한 번 꺼질 때까지 시작가 매수를 쉰다
     trade_returns: list[float] = []
@@ -47,6 +48,7 @@ def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: i
         nonlocal cash, coin, cost
         if tick:
             price += tick(price)
+        price *= 1 + slippage
         coin, cost, cash = cash / ((1 + fee_rate) * price), cash, 0.0
         fills.append({"i": len(curve), "side": "buy", "price": price})
 
@@ -54,6 +56,7 @@ def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: i
         nonlocal cash, coin, cost
         if tick:
             price = max(price - tick(price), tick(price))
+        price *= 1 - slippage
         cash = coin * price * (1 - fee_rate - sell_cost)  # sell_cost: 주식의 증권거래세처럼 팔 때만 붙는 비용
         trade_returns.append(cash / cost - 1)
         fills.append({"i": len(curve), "side": "sell", "price": price, "return": cash / cost - 1,
@@ -92,8 +95,10 @@ def simulate(strategy: Strategy, candles: list[dict], fee_rate: float, warmup: i
                 sell(exit_price, loss=True)
                 cut = True
 
-        equity = cash + coin * day["close"]
         days_holding += 1 if coin else 0
+        if liquidate_end and coin and i == len(candles) - 1:
+            sell(day["close"])
+        equity = cash + coin * day["close"]
         peak = max(peak, equity)
         mdd = min(mdd, equity / peak - 1)
         curve.append(equity)

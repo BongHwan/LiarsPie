@@ -225,7 +225,11 @@ def _search(spec: dict, folder: Path, cfg: dict) -> str:
                 progress.phase(phase, total)
             progress.update(done)
 
-        out = combosearch.search(candles, bars, ctx, spec.get("workers", simulation.WORKERS), report)
+        started = time.monotonic()
+        workers = spec.get("workers", simulation.WORKERS)
+        out = combosearch.search(candles, bars, ctx, workers, report)
+        out["validation"] = combosearch.validate(candles, bars, ctx, workers, report)
+        out["seconds"] = round(time.monotonic() - started, 1)
         start = len(candles) - bars
         result = {"id": spec["id"], "kind": spec["kind"], "market": spec["market"], "name": spec.get("name") or spec["market"],
                   "tf": spec["tf"], "tf_label": spec["tf_label"], "years": spec["years"], "bars": bars,

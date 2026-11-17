@@ -42,6 +42,7 @@
   </div>
 
   <div class="alerts" id="alerts"></div>
+  <section class="card" id="pendingOrder" hidden></section>
 
   <!-- 키 등록 안내 (키가 없을 때만) -->
   <section class="card" id="setup" hidden data-tab="home">
@@ -198,6 +199,7 @@
 <script src="/simjob.js"></script>
 <script src="/pi.js"></script>
 <script src="/settings.js"></script>
+<script src="/pending-order.js"></script>
 <script src="/theme.js"></script>
 <script>
 // ---------- 도우미 ----------
@@ -283,13 +285,14 @@ function renderAll() {
   const d = S.data, s = d.status;
   S.offset = parseTs(d.server_time).getTime() - Date.now();
   renderAlerts(d);
+  renderPendingOrder(d.pending_order, refresh);
   $('setup').hidden = !!d.keys;
   $('homeIp').textContent = (d.network && d.network.ip) || '(파이에서 확인)';
   if (!s) { setBeat('bad', '주식 봇이 아직 시작되지 않았어요'); return; }
   const age = (parseTs(d.server_time) - parseTs(s.updated_at)) / 1000;
   setBeat(age < 180 ? 'ok' : 'bad', (age < 180 ? '정상 작동 · ' : '주식 봇 응답 없음 · ') + ago(age));
   const live = s.mode === 'live';
-  $('modeChip').textContent = live ? '🔴 실거래' : '🧪 모의투자';
+  $('modeChip').textContent = (live ? '🔴 실거래' : '🧪 모의투자') + (d.buy_paused ? ' · 신규 매수 정지 중' : '');
   $('modeChip').className = 'chip ' + (live ? 'live' : 'paper');
   $('sessionChip').textContent = '🕘 ' + s.session_text;
   renderTotal(s, d);
@@ -314,7 +317,6 @@ function renderAlerts(d) {
   const add = (kind, icon, strong, text) => box.appendChild(el('div', { class: 'alert ' + kind }, el('span', { text: icon }), el('div', {}, el('b', { text: strong }), ' ' + text)));
   const s = d.status;
   if (s && s.ip_error) add('bad', '🚫', '토스증권이 지금 IP를 허용하지 않아요.', `토스증권 WTS → 설정 → Open API → 허용 IP에 ${(d.network && d.network.ip) || '지금 집 IP'}를 등록해 주세요.`);
-  if (d.pending_order) add('info', '⏳', '끊기기 전에 낸 주문을 확인하는 중이에요.', '토스증권에 결과를 물어서 장부를 맞춘 뒤 이어서 매매해요.');
   if (s && s.mode === 'live' && s.account && !s.account.synced) add('info', '🔗', '토스증권 계좌를 맞추는 중이에요.', '계좌의 현금이 금고로 들어와요.');
 }
 

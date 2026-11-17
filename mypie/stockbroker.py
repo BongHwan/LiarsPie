@@ -16,6 +16,8 @@ import uuid
 from datetime import date, datetime
 
 from . import krx, toss
+from .buycontrol import BuyPaused, paused
+from .tradelimits import record_order
 from .db import Database
 from .timeutil import KST, ts
 
@@ -71,10 +73,14 @@ class LiveStockExecutor:
         return fill["qty"], fill["price"], fill["fee"], fill["tax"]
 
     def _place(self, symbol: str, side: str, qty: int, limit: int, note: dict) -> dict:
+        if side == "buy" and paused(self.db):
+            raise BuyPaused
         pending = {"client_id": "mypie-" + uuid.uuid4().hex[:20], "symbol": symbol, "side": side, "qty": qty,
                    "price": limit, "at": ts(), **note}
         pending["account"] = getattr(self.client, "account", None)
-        self.db.set_state(self.PENDING_KEY, pending)  # 주문 직전에 적어 둔다 (정전 대비)
+        with self.db.transaction():
+            self.db.set_state(self.PENDING_KEY, pending)  # 주문 직전에 적어 둔다 (정전 대비)
+            record_order(self.db, self.mode)
         try:
             order_id = self.client.place_order(symbol, side, qty, limit, pending["client_id"])
         except toss.OrderRejected:
@@ -123,11 +129,13 @@ class LiveStockExecutor:
     def clear_pending(self) -> None:
         self.db.delete_state(self.PENDING_KEY)
 
-    def link_closed_order(self, order_id: str) -> None:
-        """사용자가 확인한 주문번호를 조회해 미확정 주문과 대조한 뒤 연결한다."""
+    def verify_closed_order(self, order_id: str, request_id: str | None = None) -> tuple[dict, dict]:
+        """사용자가 확인한 주문번호를 조회해 미확정 주문과 대조한다."""
         pending = self.pending()
         if not pending or pending.get("order_id"):
             raise toss.OrderUnknown("주문번호를 연결할 미확정 주문이 없어요")
+        if request_id is not None and pending.get("client_id") != request_id:
+            raise toss.OrderUnknown("화면에 표시된 미확정 주문이 바뀌었어요")
         self._check_pending_account(pending)
         order = self.client.order(order_id)
         if order["status"] not in FINAL:
@@ -145,10 +153,19 @@ class LiveStockExecutor:
             raise toss.OrderUnknown("두 주문의 제출 시각을 비교할 수 없어요") from e
         if not 0 <= (ordered - submitted).total_seconds() <= 120:
             raise toss.OrderUnknown("증권사 주문 시각이 봇의 제출 시각부터 2분 이내가 아니에요")
-        with self.db.transaction():
+        return pending, order
+
+    def link_closed_order(self, order_id: str, request_id: str | None = None) -> None:
+        pending, _ = self.verify_closed_order(order_id, request_id)
+        self._store_order_id(pending, order_id)
+
+    def _store_order_id(self, pending: dict, order_id: str) -> dict:
+        with self.db.transaction(immediate=True):
             if self.pending() != pending:
                 raise toss.OrderUnknown("조회 중 미확정 주문이 바뀌었어요")
-            self.db.set_state(self.PENDING_KEY, {**pending, "order_id": order_id})
+            updated = {**pending, "order_id": order_id}
+            self.db.set_state(self.PENDING_KEY, updated)
+        return updated
 
     def _check_pending_account(self, pending: dict) -> None:
         if pending.get("account") and pending["account"] != getattr(self.client, "account", None):
@@ -172,8 +189,7 @@ class LiveStockExecutor:
                 if order is None:
                     raise toss.OrderUnknown("주문 요청 ID가 일치하는 주문을 찾지 못했어요. "
                                             "종료된 주문을 토스증권에서 확인한 뒤 README의 주문번호 연결 절차를 따르세요")
-                pending["order_id"] = order["id"]
-                self.db.set_state(self.PENDING_KEY, pending)
+                pending = self._store_order_id(pending, order["id"])
             if order["status"] not in FINAL:
                 order = self._settle(order["id"])
         except toss.TossError as e:

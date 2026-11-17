@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily My_Pie backup
+
+[Timer]
+OnActiveSec=10min
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

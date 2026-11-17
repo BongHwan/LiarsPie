@@ -13,6 +13,7 @@
         <div class="v num" id="sysPower">-</div><div class="sub" id="sysPowerSub"></div><div class="meter"><i id="sysPowerBar"></i></div></div>
     </div>
     <div class="desc" id="sysFoot"></div>
+    <div class="desc" id="sysBackup"></div>
     <div class="cores">
       <div class="cores-head"><b>CPU</b><span class="muted" id="coresModel"></span><span class="muted cores-note">60초 간 이용률(%) · 위 끝 100%</span></div>
       <div class="cores-grid" id="coresGrid"><div class="muted">재는 중…</div></div>
@@ -49,6 +50,9 @@
     if (x.temp_limit_now) notes.push('🔥 온도가 높아서 속도를 낮추는 중이에요. 통풍을 확인하세요');
     if (x.db_mb != null) notes.push(`💾 기록 DB ${x.db_mb.toFixed(1)}MB`);
     $('sysFoot').textContent = notes.join(' · ');
+    $('sysBackup').textContent = x.backup_verified_at
+      ? `마지막 백업 검증 · ${x.backup_verified_at} KST`
+      : '검증을 통과한 백업이 아직 없어요.';
   }
 
   // ---- 코어별 CPU 이용률 (윈도 작업 관리자처럼 코어마다 작은 그래프, 오른쪽 끝이 지금) ----

@@ -22,6 +22,8 @@ import hashlib
 import math
 import uuid
 
+from .buycontrol import BuyPaused, paused
+from .tradelimits import record_order
 from .buyhold import add_flow
 from .db import Database
 from .strategies.combo import is_simple, normalize_rule, rule_fields
@@ -342,10 +344,14 @@ class LiveExecutor:
 
     def _place(self, params: dict, note: dict) -> dict:
         """주문을 내고 체결이 끝날 때까지 기다린다. 결과를 모르게 되면 OrderUnknown (표시는 남겨 둔다)."""
+        if params["side"] == "bid" and paused(self.db):
+            raise BuyPaused
         identifier = f"mypie-{uuid.uuid4()}"
-        self.db.set_state(self.PENDING_KEY, {**note, "identifier": identifier, "side": params["side"],
-                                             "market": params["market"], "at": ts(),
-                                             "key_fingerprint": self._key_fingerprint()})
+        with self.db.transaction():
+            self.db.set_state(self.PENDING_KEY, {**note, "identifier": identifier, "side": params["side"],
+                                                 "market": params["market"], "at": ts(),
+                                                 "key_fingerprint": self._key_fingerprint()})
+            record_order(self.db, self.mode)
         try:
             placed = self.client.place_order({**params, "identifier": identifier})
         except OrderRejected:

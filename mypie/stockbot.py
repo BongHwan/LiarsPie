@@ -24,18 +24,21 @@ import signal
 import threading
 import time
 from dataclasses import asdict
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from . import backtest, buyhold, krx, stoploss, telegram, toss
+from . import backtest, buycontrol, buyhold, krx, order_recovery, stoploss, telegram, toss
+from .botlock import bot_lock
 from .keys import env_stamp
 from .config import load_config
 from .db import Database
+from .health import record_success
 from .stockbroker import LiveStockExecutor, PaperStockExecutor
 from .strategies import STOCK_STRATEGIES, DayPlan, create_strategy, strategy_params
 from .strategies.combo import check_rule, make_rule, normalize_rule, rule_label
 from .timeutil import KST, now_kst, ts
+from .tradelimits import BuyLimits, record_order
 from .vault import VaultBook, VaultError, book_transaction, new_slot_id
 
 log = logging.getLogger("mypie.stock")
@@ -144,6 +147,7 @@ class StockBot:
         self.cfg = cfg
         self.db = db
         sc = cfg["stock"]
+        self.buy_limits = BuyLimits.from_config(sc)
         self.fee_rate = float(sc["fee_rate"])
         self.sell_tax = float(sc["sell_tax"])
         self.interval = float(sc["interval_sec"])
@@ -278,6 +282,7 @@ class StockBot:
         self._watch_keys()
         if not self._ready():
             self._write_status(now, sess)
+            record_success(self.db)
             return sess
         self._recover()
         self.active = self._active_slots(sess, now, today)  # 지금 사고팔 수 있는 계좌 (정규장 · 프리마켓 · 애프터마켓)
@@ -297,6 +302,7 @@ class StockBot:
         if time.monotonic() - self.last_snapshot >= EQUITY_SNAPSHOT_SEC:
             self.db.add_equity(self.executor.mode, 0.0, self.book.equity(self.prices))
             self.last_snapshot = time.monotonic()
+        record_success(self.db)
         return sess
 
     def _refresh_quotes(self, sess: str, now: datetime | None = None, busy: bool = False) -> None:
@@ -527,11 +533,15 @@ class StockBot:
                 cut = False  # 손절 뒤 매수 신호가 한 번 꺼졌다 → 다음 신호부터 다시 산다
                 self._set_sstate(s.id, cut=False)
             if not cut and not self._holding(s) and s.plan.buy_at_open:
+                if buycontrol.paused(self.db):
+                    continue
                 started = st.get("open_try_at") if st.get("open_try_day") == today else None
                 if started is None:
                     started = clock()
                     self._set_sstate(s.id, open_try_day=today, open_try_at=started)
                 result = self._buy(s, today, f"매수 신호 · {s.plan.note}", ref)
+                if result == "paused":
+                    continue
                 if result in ("none", "far"):
                     if clock() - started < OPEN_RETRY_SEC:
                         continue  # 다음 루프에 그때 호가로 다시
@@ -609,17 +619,33 @@ class StockBot:
     def _buy(self, slot: StockSlot, today: str, reason: str, ref: float | None = None) -> str:
         """그 순간의 호가로 산다. 결과: 'filled'(조금이라도 샀다) | 'none'(체결 0, 다음에 다시) |
         'far'(호가가 계획 가격보다 BUY_BAND 넘게 비싸서 안 냈다) | 'poor'(잔액으로 1주도 못 산다)."""
+        if buycontrol.paused(self.db):
+            return "paused"
         reason = self._where(slot, reason)
         s = self.book.slot(slot.id)
         ref = ref or self.prices[slot.symbol]
         limit = self._limit(slot, "buy")
+        if buycontrol.paused(self.db):
+            return "paused"
         if limit > ref * (1 + BUY_BAND):
             log.info("%s 호가 %s원이 계획 가격 %s원보다 %s 넘게 비싸서 쫓아 사지 않아요", slot.symbol, limit, ref, BUY_BAND)
             return "far"
         result = None
         if s["cash"] >= limit:
-            result = self._call(self.executor.buy, slot.symbol, s["cash"], limit,
-                                {"slot": slot.id, "reason": reason, "day": today})
+            exposure = sum(entry["cost"] for entry in self.book.data["slots"].values() if entry["symbol"] == slot.symbol)
+            budget, blocked = self.buy_limits.budget(self.db, self.executor.mode, s["cash"], exposure,
+                                                     limit * (1 + self.fee_rate))
+            if blocked:
+                key = (slot.symbol, now_kst().date(), blocked)
+                if key not in self.warned:
+                    self.warned.add(key)
+                    self.event("warning", f"{self._tag(slot)}신규 매수 중단 · {blocked}", notify=True)
+                return "limited"
+            try:
+                result = self._call(self.executor.buy, slot.symbol, budget, limit,
+                                    {"slot": slot.id, "reason": reason, "day": today})
+            except buycontrol.BuyPaused:
+                return "paused"
         if result is None:
             if (slot.id, today) not in self.warned:
                 self.warned.add((slot.id, today))
@@ -635,6 +661,8 @@ class StockBot:
             trade = self.book.apply_buy(slot.id, qty, fill_price, fee, reason)
             trade["ref"] = ref
             self._set_sstate(slot.id, last_buy_day=today, cut=False)
+            if self.executor.mode == "paper":
+                record_order(self.db, "paper")
             self.db.add_trade(self.executor.mode, slot.symbol, trade)
             self.executor.clear_pending()
         self.event("info", f"🔴 {self._tag(slot)}매수 {qty:,}주 @ {fill_price:,.0f}원 ({trade['krw']:,.0f}원) · {reason}",
@@ -661,6 +689,8 @@ class StockBot:
         with book_transaction(self.book):
             trade = self.book.apply_sell(slot.id, qty, fill_price, fee, tax, reason)
             trade["ref"] = ref
+            if self.executor.mode == "paper":
+                record_order(self.db, "paper")
             self.db.add_trade(self.executor.mode, slot.symbol, trade)
             if stop_state:
                 self._set_sstate(slot.id, **stop_state)
@@ -670,7 +700,7 @@ class StockBot:
                            f"({pct:+.2f}%) · {reason}", notify=True)
 
     def _recover(self) -> None:
-        result = self.executor.recover()
+        result = order_recovery.recover(self.db, LiveStockExecutor.PENDING_KEY, self.executor.recover)
         if not result:
             return
         pending, fill = result["pending"], result["fill"]
@@ -1100,14 +1130,16 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
-    bot = StockBot(cfg, Database(cfg["stock"]["db_path"]))
-    if args.once:
-        bot.step()
-        print(json.dumps(bot.db.get_state("status"), ensure_ascii=False, indent=2))
-        return
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: bot.stop_event.set())
-    bot.run()
+    path = cfg["stock"]["db_path"]
+    with bot_lock(path), closing(Database(path)) as db:
+        bot = StockBot(cfg, db)
+        if args.once:
+            bot.step()
+            print(json.dumps(db.get_state("status"), ensure_ascii=False, indent=2))
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: bot.stop_event.set())
+        bot.run()
 
 
 if __name__ == "__main__":

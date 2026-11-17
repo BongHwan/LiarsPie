@@ -30,6 +30,7 @@
   </div>
 
   <div class="alerts" id="alerts"></div>
+  <section class="card" id="pendingOrder" hidden></section>
 
   <!-- 개요 -->
   <div class="hero four" id="overview" style="margin-top:14px" data-tab="home">
@@ -231,6 +232,7 @@
 <script src="/simjob.js"></script>
 <script src="/pi.js"></script>
 <script src="/settings.js"></script>
+<script src="/pending-order.js"></script>
 <script src="/theme.js"></script>
 <script>
 // ---------- 도우미 ----------
@@ -349,6 +351,7 @@ function renderAll() {
   renderGuides(d);
   renderMovers(d);
   renderAlerts(d);
+  renderPendingOrder(d.pending_order, refreshStatus);
   if (!s) { setBeat('bad', '봇이 아직 시작되지 않았어요'); return; }
   if (!S.sel || !s.slots.some(x => x.rank_key === S.sel)) {
     const prev = S.sel; S.sel = s.slots.length ? s.slots[0].rank_key : null;
@@ -360,7 +363,7 @@ function renderAll() {
   setBeat(alive ? 'ok' : 'bad', (alive ? '정상 작동 · ' : '봇 응답 없음 · ') + ago(age));
 
   const live = s.mode === 'live';
-  $('modeChip').textContent = live ? '🔴 실거래' : '🧪 모의투자';
+  $('modeChip').textContent = (live ? '🔴 실거래' : '🧪 모의투자') + (d.buy_paused ? ' · 신규 매수 정지 중' : '');
   $('modeChip').className = 'chip ' + (live ? 'live' : 'paper');
   $('slotsChip').textContent = s.slots.length ? `📦 ${[...new Set(s.slots.map(x => sym(x.market)))].join(' · ')}` : '📦 계좌 없음';
 
@@ -584,8 +587,6 @@ function renderAlerts(d) {
       add('bad', '🚫', '업비트가 지금 IP를 허용하지 않아요.', `업비트 Open API 관리에서 허용 IP를 ${net.ip || '지금 집 IP'}(으)로 바꿔 주세요. 바꾸면 자동으로 다시 주문해요.`);
     else if (d.live_ready && net.ip_changed)
       add('warn', '🌐', '집 공인 IP가 바뀐 것 같아요.', `${net.upbit_ok_ip} → ${net.ip} · 업비트 Open API 관리에서 허용 IP를 ${net.ip}(으)로 바꿔야 실거래 주문이 나가요.`);
-    if (d.pending_order)
-      add('info', '⏳', '끊기기 전에 낸 주문을 확인하는 중이에요.', '업비트에 결과를 물어서 장부를 맞춘 뒤 바로 이어서 매매해요.');
     const small = s.slots.filter(x => !x.holding && x.book.krw > 0 && x.book.krw < (d.min_order || 5000));
     if (small.length) add('warn', '🪙', '원화가 너무 적은 계좌가 있어요.', `${small.map(x => x.name).join(', ')}의 원화가 업비트 최소 주문 금액(5,000원)보다 적어서 살 수 없어요. 금고에서 더 넣어 주세요.`);
   }

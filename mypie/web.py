@@ -19,7 +19,7 @@
   POST /api/keys                         업비트·토스증권 API 키 넣기 (PIN 필요, 집 와이파이에서만)
   POST /api/login/send|verify|wait, /api/logout  텔레그램 코드 로그인 (wait: 텔레그램 [✅ 들여보내기]를 눌렀는지)
 
-텔레그램이 연결돼 있으면 모든 페이지·API에 로그인이 필요하다 (/healthz 제외).
+텔레그램이 연결돼 있으면 페이지·API에 로그인이 필요하다 (/healthz, /healthz/bots 등 공개 경로 제외).
 """
 
 import json
@@ -38,11 +38,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import auth, backtest, combosearch, curve, krx, network, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
+from . import auth, backtest, buycontrol, combosearch, curve, krx, network, order_recovery, pin, simjob, simulation, stoploss, telegram, timeframes, toss, upbit
 from .stockbot import DAY_TF, daily_ready, slippage_summary, stock_type
-from .broker import MIN_ORDER_KRW
+from .broker import MIN_ORDER_KRW, LiveExecutor
 from .config import load_config
 from .db import Database
+from .backup import last_success as last_backup_success
+from .health import HEALTH_PATH, bot_status
+from .stockbroker import LiveStockExecutor
 from .keys import load_keys, read_env, save_keys, write_env
 from .strategies import STOCK_STRATEGIES, STRATEGIES, strategy_params
 from .strategies.combo import check_rule, is_simple, make_rule, normalize_rule, rule_fields
@@ -89,15 +92,13 @@ def build_payload(db_path: str) -> dict:
         return payload
     try:
         status = db.get_state("status")
+        payload["buy_paused"] = buycontrol.paused(db)
         payload["status"] = status
         payload["trades"] = db.recent_trades(30)
         payload["events"] = db.recent_events(40)
         if status:
             payload["equity"] = db.equity_since(status["mode"], ts(now_kst() - timedelta(days=EQUITY_DAYS)))
-            pending_order = db.get_state("live_pending_order") if status["mode"] == "live" else None
-            if pending_order:
-                pending_order.pop("key_fingerprint", None)
-            payload["pending_order"] = pending_order
+        payload["pending_order"] = order_recovery.summary(db, LiveExecutor.PENDING_KEY)
         payload["rankings"] = db.get_state("rankings") or {}
         payload["ranking_request"] = db.get_state("ranking_request")
         payload["markets"] = (db.get_state("markets") or {}).get("list", [])
@@ -497,7 +498,7 @@ def search_request(main_db: str, stock_db: str, cfg: dict, data: dict) -> tuple[
 
 # ---- 주식 (토스증권, 주식 봇 DB) ----
 
-STOCK_ACTIONS = ("add", "remove", "close", "cancel_close", "strategy", "transfer", "mode", "paper_cash")
+STOCK_ACTIONS = ("add", "remove", "close", "cancel_close", "strategy", "transfer", "mode", "paper_cash", *buycontrol.ACTIONS)
 
 
 def _slim_rankings(rankings: dict) -> dict:
@@ -531,6 +532,7 @@ def build_stock_payload(stock_db: str, main_db: str) -> dict:
     try:
         status = db.get_state("status")
         mode = (status or {}).get("mode", "paper")
+        payload["buy_paused"] = buycontrol.paused(db)
         payload["status"] = status
         payload["trades"] = [t for t in db.recent_trades(60) if t["mode"] == mode][:30]
         payload["slippage"] = slippage_summary(db, mode)  # 계획 가격 대비 실제 체결 (호가 몇 칸 불리했나)
@@ -539,7 +541,7 @@ def build_stock_payload(stock_db: str, main_db: str) -> dict:
         payload["rankings"] = _slim_rankings(db.get_state("rankings") or {})
         payload["results"] = db.get_state("request_results") or []
         payload["pending"] = len(db.states("request:"))
-        payload["pending_order"] = db.get_state("stock_pending_order")
+        payload["pending_order"] = order_recovery.summary(db, LiveStockExecutor.PENDING_KEY)
     finally:
         db.close()
     return payload
@@ -767,11 +769,47 @@ def request_stock(stock_db: str, main_db: str, data: dict) -> tuple[int, dict]:
     if not db:
         return 503, {"ok": False, "message": "주식 봇이 아직 시작되지 않았어요."}
     try:
+        if action in buycontrol.ACTIONS:
+            message = buycontrol.set_paused(db, buycontrol.ACTIONS[action])
+            return 200, {"ok": True, "message": message}
         request["id"] = str(time.time_ns())
         db.set_state(f"request:{request['id']}", request)
     finally:
         db.close()
     return 200, {"ok": True, "message": "주식 봇에게 전했어요. 곧 처리돼요.", "id": request["id"]}
+
+
+def request_stock_recovery(stock_db: str, main_db: str, cfg: dict, data: dict) -> tuple[int, dict]:
+    action, request_id, order_id = data.get("action"), data.get("request_id"), data.get("order_id")
+    if (action not in ("verify", "link") or not isinstance(request_id, str) or not request_id
+            or not isinstance(order_id, str) or not 0 < len(order_id) <= 256
+            or not order_id.isprintable() or any(c.isspace() for c in order_id)):
+        return 400, {"ok": False, "message": "미확정 주문과 증권사 주문번호를 확인해 주세요."}
+    failure = _pin_ok(main_db, str(data.get("pin", "")))
+    if failure:
+        return failure[0], {"ok": False, "message": failure[1]}
+    creds = toss.load_credentials()
+    if not creds:
+        return 400, {"ok": False, "message": "토스증권 API 키가 설정되어 있지 않아요."}
+    db = _open(stock_db)
+    if not db:
+        return 503, {"ok": False, "message": "주식 장부를 열 수 없어요."}
+    try:
+        pending = order_recovery.summary(db, LiveStockExecutor.PENDING_KEY)
+        if not pending or not pending["can_link"] or pending["request_id"] != request_id:
+            return 409, {"ok": False, "message": "현재 화면에서 연결할 수 있는 미확정 주문이 없어요. 상태를 새로 확인해 주세요."}
+        stock = cfg["stock"]
+        executor = LiveStockExecutor(db, toss.TossClient(*creds, db=db), stock["fee_rate"], stock["sell_tax"])
+        if action == "verify":
+            _, order = executor.verify_closed_order(order_id, request_id)
+            preview = {key: order[key] for key in ("id", "symbol", "side", "qty", "price", "ordered_at", "filled_qty", "status")}
+            return 200, {"ok": True, "order": preview}
+        executor.link_closed_order(order_id, request_id)
+        return 200, {"ok": True, "message": "주문번호를 연결했어요. 주식 봇이 기존 복구 절차로 처리해요."}
+    except toss.TossError as e:
+        return 409, {"ok": False, "message": str(e)}
+    finally:
+        db.close()
 
 
 def request_stock_ranking(stock_db: str, symbol: str) -> tuple[int, str]:
@@ -996,7 +1034,7 @@ def _read_pmic(model: str) -> float | None:
 
 def build_system(db_path: str) -> dict:
     """라즈베리파이 상태. 파이가 아닌 곳에서는 알 수 있는 것만."""
-    info: dict = {"server_time": ts()}
+    info: dict = {"server_time": ts(), "backup_verified_at": last_backup_success(db_path)}
     model = (_read("/proc/device-tree/model") or "").rstrip("\x00")
     info["model"] = model or None
     info.update(_power(model, _cpu_busy(), _read_pmic(model)))
@@ -1062,7 +1100,7 @@ def _check_pin(db: Database, pin_input: str) -> tuple[int, str] | None:
     return None
 
 
-COIN_ACTIONS = ("add", "remove", "close", "cancel_close", "strategy", "transfer", "mode", "paper_cash")
+COIN_ACTIONS = ("add", "remove", "close", "cancel_close", "strategy", "transfer", "mode", "paper_cash", *buycontrol.ACTIONS)
 
 
 def request_coin(db_path: str, data: dict) -> tuple[int, dict]:
@@ -1124,6 +1162,9 @@ def request_coin(db_path: str, data: dict) -> tuple[int, dict]:
     if not db:
         return 503, {"ok": False, "message": "봇이 아직 시작되지 않았어요."}
     try:
+        if action in buycontrol.ACTIONS:
+            message = buycontrol.set_paused(db, buycontrol.ACTIONS[action])
+            return 200, {"ok": True, "message": message}
         request["id"] = str(time.time_ns())
         db.set_state(f"request:{request['id']}", request)
     finally:
@@ -1542,12 +1583,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         route, query = url.path, parse_qs(url.query)
-        if route in ("/app.css", "/rules.js", "/tabs.js", "/curve.js", "/slotnums.js", "/finder.js", "/pi.js", "/simjob.js", "/settings.js", "/theme.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
+        if route in ("/app.css", "/rules.js", "/tabs.js", "/curve.js", "/slotnums.js", "/finder.js", "/pi.js", "/simjob.js", "/settings.js", "/theme.js", "/pending-order.js"):  # 화면 모양·도우미뿐인 공용 파일이라 로그인 전에도 준다
             kind = "text/css" if route.endswith(".css") else "text/javascript"
             self._send(200, (STATIC_DIR / route[1:]).read_bytes(), kind + "; charset=utf-8")
             return
         if route == "/healthz":
             self._send(200, b"ok", "text/plain")
+            return
+        if route == HEALTH_PATH:
+            self._json(200, bot_status(self.db_path, self.stock_db_path))
             return
         if not self._authed():
             if route.startswith("/api/"):
@@ -1608,7 +1652,7 @@ class Handler(BaseHTTPRequestHandler):
         public = ("/api/login/send", "/api/login/verify", "/api/login/wait")
         private = ("/api/control", "/api/ranking", "/api/logout",
                    "/api/telegram/start", "/api/telegram/link", "/api/telegram/action",
-                   "/api/stock/control", "/api/stock/ranking", "/api/simjob", "/api/search", "/api/pin", "/api/keys")
+                   "/api/stock/control", "/api/stock/recovery", "/api/stock/ranking", "/api/simjob", "/api/search", "/api/pin", "/api/keys")
         if route not in public + private:
             self._send(404, b"not found", "text/plain")
             return
@@ -1631,6 +1675,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = {"ok": code == 200, "message": message}
             elif route == "/api/stock/control":
                 code, body = request_stock(self.stock_db_path, self.db_path, data)
+            elif route == "/api/stock/recovery":
+                code, body = request_stock_recovery(self.stock_db_path, self.db_path, self.cfg, data)
             elif route == "/api/pin":
                 code, body = change_pin(self.db_path, data)
             elif route == "/api/keys":

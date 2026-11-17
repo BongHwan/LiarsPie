@@ -167,7 +167,8 @@ const Finder = (() => {
     }, 1500);
   }
 
-  const PHASES = { data: '과거 봉을 받는 중', prep: '전략 계산 중', sides: '살 때·팔 때 판단 합치는 중', search: '조합 굴리는 중' };
+  const PHASES = { data: '과거 봉을 받는 중', prep: '전략 계산 중', sides: '살 때·팔 때 판단 합치는 중',
+    search: '조합 굴리는 중', validate: '선정 이후 구간 검증 중' };
   function drawJob(job) {
     const mine = job && String(job.id || '').startsWith(`search-${opt.kind}-`);
     const running = job && job.state === 'running';
@@ -223,6 +224,28 @@ const Finder = (() => {
     } catch (e) { /* 그대로 */ }
   }
 
+  function drawValidation(validation) {
+    const section = node('section', {}, node('h3', { text: '선정 이후 구간 검증' }));
+    if (!validation || !validation.folds.length) {
+      section.append(node('p', { class: 'muted', text: validation
+        ? `구간 검증에는 최소 ${validation.min_bars}봉이 필요해요.`
+        : '이 결과는 구간 검증을 도입하기 전에 저장했어요. 다시 계산하면 검증 결과가 표시돼요.' }));
+      return section;
+    }
+    section.append(node('p', { class: 'note', text: `구간별로 앞선 봉에서 조합을 다시 고르고 다음 구간에서 검증했어요. 비용 증가 조건은 수수료 ${validation.fee_multiplier}배, 매수·매도마다 체결가 ${(100 * validation.slippage).toFixed(2)}% 불리해요.` }),
+      node('p', { text: `검증 구간 복리 수익률 · 기본 ${pct(validation.baseline_return)} · 비용 증가 ${pct(validation.stress_return)}` }));
+    section.append(node('p', { class: 'note', text: validation.boundary_liquidation
+      ? '다음 구간으로 넘어갈 때 남은 보유분의 청산 비용을 반영했어요. 마지막 구간은 종료 시점의 평가액으로 계산해요.'
+      : '이전 계산 결과에는 구간 전환 청산 비용이 빠져 있어요. 다시 계산하면 비용이 반영돼요.' }));
+    for (const fold of validation.folds) {
+      section.append(node('div', { class: 'finder-sub' },
+        node('b', { text: fold.label }),
+        node('div', { text: `선정 ${fold.train_from} ~ ${fold.train_to} · 검증 ${fold.test_from} ~ ${fold.test_to}` }),
+        node('div', { text: `검증 수익률 · 기본 ${pct(fold.baseline.total_return)} · 비용 증가 ${pct(fold.stress.total_return)}` })));
+    }
+    return section;
+  }
+
   function drawResult(r) {
     ui.result.replaceChildren();
     if (!r) {
@@ -242,6 +265,7 @@ const Finder = (() => {
       node('div', { class: 'finder-sub' }, '그냥 들고 있었다면 ', num(h.total_return), ` · 최대 낙폭 ${pct(h.mdd)} · 섞은 전략: `,
         (r.singles || []).filter((s) => r.top.includes(s.name)).map((s) => s.label).join(', ')),
     ].filter(Boolean));
+    ui.result.append(drawValidation(r.validation), node('h3', { text: '전체 기간 과거 순위' }));
     const list = node('div', { class: 'finder-list' });
     (r.results || []).slice(0, more ? r.results.length : SHOW).forEach((x, i) => {
       const steady = x.first_half != null && h.first_half != null && x.first_half > h.first_half && x.second_half > h.second_half;
@@ -272,8 +296,8 @@ const Finder = (() => {
       b.onclick = () => { more = !more; drawResult(r); };
       ui.result.append(b);
     }
-    ui.result.append(node('p', { class: 'note', text: '과거 성적이에요. 많이 비교해서 고를수록 과거에만 우연히 맞은 조합이 뽑히기 쉬워요. '
-      + "'두 절반 다 이김'(앞 절반·뒤 절반 모두 그냥 들고 있기보다 나음)인 것을 먼저 보세요." }));
+    ui.result.append(node('p', { class: 'note', text: "전체 기간 순위의 '두 절반 다 이김'은 조합을 고를 때 사용한 기간 안에서의 결과예요. "
+      + '선정 이후의 성과는 위 검증 구간 결과에서 확인하세요.' }));
   }
 
   function init(o) {

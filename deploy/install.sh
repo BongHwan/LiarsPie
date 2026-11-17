@@ -10,9 +10,11 @@ fi
 
 mkdir -p ~/.config/systemd/user
 cp deploy/mypie-bot.service deploy/mypie-web.service deploy/mypie-stock.service ~/.config/systemd/user/
+cp deploy/mypie-backup.service deploy/mypie-backup.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --quiet mypie-bot mypie-web mypie-stock
 systemctl --user restart mypie-bot mypie-web mypie-stock
+systemctl --user enable --now --quiet mypie-backup.timer
 
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
   echo

@@ -170,6 +170,21 @@ class Database:
                 (account, ts(), price, equity),
             )
 
+    def daily_trade_count(self, mode: str, day: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE mode = ? AND ts BETWEEN ? AND ?",
+            (mode, day + " 00:00:00", day + " 23:59:59"),
+        ).fetchone()
+        return row[0]
+
+    def daily_loss_limit_hit(self, mode: str, day: str, limit: float) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM (SELECT SUM(profit) OVER (ORDER BY id) AS net "
+            "FROM trades WHERE mode = ? AND side = 'sell' AND ts BETWEEN ? AND ?) WHERE net <= ? LIMIT 1",
+            (mode, day + " 00:00:00", day + " 23:59:59", -limit),
+        ).fetchone()
+        return row is not None
+
     def trades(self, mode: str, market: str | None = None, since: str = "") -> list[dict]:
         """한 계좌(모의/실거래)의 매매 기록 (오래된 것 → 최신)."""
         if market:

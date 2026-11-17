@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+from mypie import buycontrol
 
 from mypie import krx, pin, stockbot, telegram, toss, web
 from mypie.config import DEFAULTS
@@ -552,6 +553,45 @@ class StockBotTest(TempDb):
         bot.step(at(DAY2, "09:04"))
         self.assertFalse(self.results()[-1][0])                          # 너무 작은 손절선은 받지 않는다
 
+    def test_order_limit_counts_rejection_across_restart_and_allows_sell(self):
+        self.cfg["stock"]["max_daily_orders"] = 2
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot("live")
+        for i in (1, 2):
+            self.request(i, action="add", symbol=self.SYMBOL, strategy="buy_and_hold",
+                         amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        bot.prices[self.SYMBOL] = 100_000
+        first, second = bot.slots
+        self.assertEqual(bot._buy(first, DAY1, "테스트"), "filled")
+        self.toss.reject = True
+        with self.assertRaises(toss.OrderRejected):
+            bot._buy(second, DAY1, "테스트")
+        self.toss.reject = False
+        restarted = self.make_bot("live")
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        restarted.step(at(DAY1, "10:00"))
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy", "sell"])
+        self.assertTrue(any("주문 횟수 한도" in e["message"] for e in self.db.recent_events()))
+
+    def test_telegram_buy_pause_persists_and_still_allows_stop_loss(self):
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot("live")
+        self.request(1, action="add", symbol=self.SYMBOL, strategy="buy_and_hold", amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        path = str(self.db.path)
+        self.assertIn("일시정지", buycontrol.telegram_command("/pausebuy stock", self.db, path))
+        restarted = self.make_bot("live")
+        restarted.step(at(DAY1, "09:01"))
+        self.assertEqual(self.toss.placed, [])
+        self.assertIn("재개", buycontrol.telegram_command("/resumebuy stock", self.db, path))
+        restarted.step(at(DAY1, "09:02"))
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy"])
+        buycontrol.telegram_command("/매수정지 주식", self.db, path)
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        restarted.step(at(DAY1, "10:00"))
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy", "sell"])
+
     def test_recovered_stop_loss_keeps_buy_signal_blocked(self):
         self.toss.set(self.SYMBOL, DAY1, 100_000)
         bot = self.make_bot("live")
@@ -889,6 +929,58 @@ class StockWebTest(TempDb):
     def tearDown(self):
         web._pin_failures.clear()
         super().tearDown()
+
+    def test_pending_order_preview_and_link_require_pin_and_matching_order(self):
+        from mypie import order_recovery
+
+        key = LiveStockExecutor.PENDING_KEY
+        record = {"client_id": "pending-1", "account": "1", "symbol": "005930", "side": "buy",
+                  "qty": 2, "price": 100, "at": f"{DAY1} 10:00:00"}
+        self.db.set_state(key, record)
+
+        def unavailable():
+            raise toss.OrderUnknown("주문 요청 ID를 찾지 못했어요")
+
+        with self.assertRaises(toss.OrderUnknown):
+            order_recovery.recover(self.db, key, unavailable)
+        pending = web.build_stock_payload(self.stock_path, self.main_path)["pending_order"]
+        self.assertTrue(pending["can_link"])
+        self.assertEqual((pending["symbol"], pending["side"], pending["at"]), ("005930", "buy", record["at"]))
+        self.assertIn("찾지 못했어요", pending["reason"])
+        self.assertNotIn("account", pending)
+
+        order = {"orderId": "verified", "symbol": "005930", "side": "BUY", "quantity": "2", "price": "100",
+                 "status": "FILLED", "orderedAt": f"{DAY1}T10:00:05+09:00",
+                 "execution": {"filledQuantity": "2", "averageFilledPrice": "100"}}
+        data = {"action": "verify", "request_id": "pending-1", "order_id": "verified"}
+        request = lambda body: web.request_stock_recovery(self.stock_path, self.main_path, DEFAULTS, body)
+        with mock.patch.object(toss, "load_credentials", return_value=("id", "secret", "1")), \
+                mock.patch.object(toss.TossClient, "_call", return_value=order) as call:
+            self.assertEqual(request(data)[0], 403)
+            call.assert_not_called()
+            data["pin"] = "2468"
+            code, body = request(data)
+            self.assertEqual((code, body["order"]["filled_qty"]), (200, 2))
+            self.assertEqual(self.db.get_state(key), record)
+            self.assertEqual(request({**data, "action": "link", "request_id": "stale"})[0], 409)
+            call.return_value = {**order, "side": "SELL"}
+            self.assertEqual(request({**data, "action": "link"})[0], 409)
+            self.assertEqual(self.db.get_state(key), record)
+            call.return_value = order
+            self.assertEqual(request({**data, "action": "link"})[0], 200)
+            self.assertEqual(self.db.get_state(key)["order_id"], "verified")
+            self.assertTrue(all(c.args[0] == "GET" for c in call.call_args_list))
+            self.assertEqual(self.db.recent_trades(), [])
+
+    def test_web_buy_pause_requires_pin_and_only_changes_stock(self):
+        request = {"action": "pause_buy"}
+        self.assertEqual(web.request_stock(self.stock_path, self.main_path, request)[0], 403)
+        self.assertEqual(web.request_stock(self.stock_path, self.main_path, {**request, "pin": "2468"})[0], 200)
+        self.assertTrue(web.build_stock_payload(self.stock_path, self.main_path)["buy_paused"])
+        self.assertFalse(web.build_payload(self.main_path)["buy_paused"])
+        self.assertEqual(web.request_stock(self.stock_path, self.main_path,
+                                           {"action": "resume_buy", "pin": "2468"})[0], 200)
+        self.assertFalse(web.build_stock_payload(self.stock_path, self.main_path)["buy_paused"])
 
     def control(self, **data):
         return web.request_stock(self.stock_path, self.main_path, {"pin": "2468", **data})
