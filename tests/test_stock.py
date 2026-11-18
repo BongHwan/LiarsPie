@@ -553,6 +553,39 @@ class StockBotTest(TempDb):
         bot.step(at(DAY2, "09:04"))
         self.assertFalse(self.results()[-1][0])                          # 너무 작은 손절선은 받지 않는다
 
+    def test_partial_stop_loss_retries_after_restart_and_price_rebound(self):
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot("live")
+        self.request(1, action="add", symbol=self.SYMBOL, strategy="buy_and_hold", amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        bot.step(at(DAY1, "09:01"))
+        self.toss.fill_ratio = 0.5
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        bot.step(at(DAY1, "10:00"))
+        self.assertEqual(self.slot(bot)["qty"], 2)
+        self.toss.fill_ratio = 1
+        self.toss.set(self.SYMBOL, DAY2, 95_000)
+        restarted = self.make_bot("live")
+        restarted.step(at(DAY2, "09:01"))
+        self.assertEqual(self.slot(restarted)["qty"], 0)
+        self.assertEqual([side for side, _, _ in self.trades()], ["buy", "sell", "sell"])
+        self.assertFalse(restarted._sstate(restarted.slots[0]).get("stop_selling"))
+
+    def test_unfilled_stop_loss_retries_after_price_rebound(self):
+        self.toss.set(self.SYMBOL, DAY1, 100_000)
+        bot = self.make_bot("live")
+        self.request(1, action="add", symbol=self.SYMBOL, strategy="buy_and_hold", amount=350_000, stop_loss=10)
+        bot.step(at(DAY1, "08:30"))
+        bot.step(at(DAY1, "09:01"))
+        self.toss.fill_ratio = 0
+        self.toss.quotes_[self.SYMBOL]["price"] = 89_000
+        bot.step(at(DAY1, "10:00"))
+        self.assertEqual(self.slot(bot)["qty"], 3)
+        self.toss.fill_ratio = 1
+        self.toss.quotes_[self.SYMBOL]["price"] = 95_000
+        bot.step(at(DAY1, "10:01"))
+        self.assertEqual(self.slot(bot)["qty"], 0)
+
     def test_order_limit_counts_rejection_across_restart_and_allows_sell(self):
         self.cfg["stock"]["max_daily_orders"] = 2
         self.toss.set(self.SYMBOL, DAY1, 100_000)

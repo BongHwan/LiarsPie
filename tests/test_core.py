@@ -2069,8 +2069,7 @@ class WebLoginTest(TempDbTest):
         self.assertIn("Max-Age=86400", cookie)                             # 쿠키도 최대 24시간
         session = cookie.split(";")[0]
         self.assertEqual(self.request("/api/status", cookie=session)[0], 200)
-        self.assertEqual(self.request("/api/status")[0], 200)              # 같은 IP는 쿠키 없이도 하루 동안
-        self.db.set_state(auth.TRUSTED_KEY, {"127.0.0.1": 0})              # 하루가 지나면
+        self.assertEqual(self.request("/api/status")[0], 401)              # 같은 IP의 다른 브라우저는 로그인 필요
         self.assertEqual(self.request("/api/control", {}, cookie=None)[0], 401)
         self.assertEqual(self.request("/api/status", cookie=session)[0], 200)  # 쿠키는 그대로 30일
         self.request("/api/logout", {}, cookie=session)
@@ -2091,6 +2090,7 @@ class WebLoginTest(TempDbTest):
         self.assertTrue(json.loads(body)["ok"])
         self.assertIn("SameSite=Lax", cookie)
         self.assertEqual(self.request("/api/status", cookie=cookie.split(";")[0])[0], 200)
+        self.assertEqual(self.request("/api/status")[0], 401)
         self.assertFalse(json.loads(self.request("/api/login/wait", {"ask": ask})[1])["ok"])  # 한 번만
         self.assertIsNone(self.db.get_state(auth.CODE_KEY))                  # 버튼으로 들어왔으니 코드는 지운다
 
@@ -2100,10 +2100,8 @@ class WebLoginTest(TempDbTest):
         self.assertTrue(json.loads(self.request("/api/login/wait", {"ask": ask})[1])["rejected"])
         self.assertIsNone(self.db.get_state(auth.CODE_KEY))                  # 거절하면 코드도 못 쓴다
 
-    def test_logout_also_forgets_the_ip(self):
+    def test_previously_trusted_ip_does_not_authenticate(self):
         auth.trust_ip(self.db, "127.0.0.1", 24)
-        self.assertEqual(self.request("/api/status")[0], 200)
-        self.request("/api/logout", {})
         self.assertEqual(self.request("/api/status")[0], 401)
 
     def test_no_login_when_telegram_not_connected(self):

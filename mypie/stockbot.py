@@ -518,6 +518,8 @@ class StockBot:
         사는 건 OPEN_RETRY_SEC 동안 (호가가 시가보다 BUY_BAND 넘게 비싸면 쫓아 사지 않고 기다리다 접는다)."""
         for s in slots:
             st = self._sstate(s)
+            if st.get("stop_selling"):
+                continue
             if st.get("open_done_day") == today:
                 continue
             ref = (self.quotes.get(s.symbol) or {}).get("open") or self.prices[s.symbol]
@@ -556,10 +558,17 @@ class StockBot:
 
     def _intraday(self, slot: StockSlot, today: str) -> None:
         plan, st, price = slot.plan, self._sstate(slot), self.prices[slot.symbol]
+        if st.get("stop_selling"):
+            if self._holding(slot):
+                self._sell(slot, "손절 잔여 수량 매도", stop_state={"last_stop_day": today, "cut": True})
+            else:
+                self._set_sstate(slot.id, stop_selling=False)
+            return
         if self._holding(slot):
             loss = self._loss_line(slot)  # 손절선은 산 직후에도 지킨다
             today_open = (self.quotes.get(slot.symbol) or {}).get("open") or price
             if loss is not None and price <= loss:  # 계획 가격 = 시뮬레이션과 같이 min(시가, 이탈 가격)
+                self._set_sstate(slot.id, stop_selling=True, last_stop_day=today, cut=True)
                 self._sell(slot, f"{stoploss.text(slot.stop_loss)} ({loss:,.0f}원) 이탈", min(today_open, loss),
                            stop_state={"last_stop_day": today, "cut": True})
                 return
@@ -694,6 +703,8 @@ class StockBot:
             self.db.add_trade(self.executor.mode, slot.symbol, trade)
             if stop_state:
                 self._set_sstate(slot.id, **stop_state)
+            if not self._holding(slot) and self._sstate(slot).get("stop_selling"):
+                self._set_sstate(slot.id, stop_selling=False)
             self.executor.clear_pending()
         pct = trade["profit"] / trade["cost"] * 100 if trade.get("cost") else 0.0
         self.event("info", f"🔵 {self._tag(slot)}매도 {qty:,}주 @ {fill_price:,.0f}원 · 손익 {trade['profit']:+,.0f}원 "
@@ -717,6 +728,8 @@ class StockBot:
                     trade = self.book.apply_sell(sid, fill["qty"], fill["price"], fill["fee"], fill["tax"], reason)
                     if pending.get("stop_state"):
                         self._set_sstate(sid, **pending["stop_state"])
+                    if self.book.slot(sid)["qty"] <= 0 and (self.db.get_state("slot_state") or {}).get(sid, {}).get("stop_selling"):
+                        self._set_sstate(sid, stop_selling=False)
                 self.db.add_trade(self.executor.mode, pending["symbol"], trade)
                 self.executor.clear_pending()
             self.event("warning", f"[실거래] 끊기기 전에 낸 {pending['symbol']} {side} 주문이 체결돼 있어서 장부에 "

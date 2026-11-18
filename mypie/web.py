@@ -1512,8 +1512,6 @@ def login_wait(db_path: str, ask: str, hours: float, client: dict, trust_hours: 
         with _login_lock:
             answer = auth.take_ask(db, ask, client["ip"])
             token = auth.create_session(db, hours, client) if answer == "yes" else None
-            if token and trust_hours > 0:
-                auth.trust_ip(db, client["ip"], trust_hours)
     finally:
         db.close()
     if token:
@@ -1531,8 +1529,6 @@ def login_verify(db_path: str, code: str, hours: float, client: dict, trust_hour
         with _login_lock:
             ok, message = auth.check_code(db, code)
             token = auth.create_session(db, hours, client) if ok else None
-            if ok and trust_hours > 0:
-                auth.trust_ip(db, client["ip"], trust_hours)  # 같은 IP는 쿠키를 잃어도 하루 동안 다시 묻지 않는다
     finally:
         db.close()
     if not ok:
@@ -1571,7 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
         db = _open(self.db_path)
         try:
-            return bool(db) and (auth.valid_session(db, self._cookie_token(), self.session_hours) or auth.trusted_ip(db, self._client()["ip"]))
+            return bool(db) and auth.valid_session(db, self._cookie_token(), self.session_hours)
         finally:
             if db:
                 db.close()

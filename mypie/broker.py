@@ -347,7 +347,9 @@ class LiveExecutor:
         if params["side"] == "bid" and paused(self.db):
             raise BuyPaused
         identifier = f"mypie-{uuid.uuid4()}"
-        with self.db.transaction():
+        with self.db.transaction(immediate=True):
+            if self.pending():
+                raise OrderUnknown("확인되지 않은 주문이 있어 새 주문을 낼 수 없어요")
             self.db.set_state(self.PENDING_KEY, {**note, "identifier": identifier, "side": params["side"],
                                                  "market": params["market"], "at": ts(),
                                                  "key_fingerprint": self._key_fingerprint()})

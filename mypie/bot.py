@@ -811,6 +811,8 @@ class Bot:
         self.book = self._open_book()
         self.slots = []
         self._load_slots()
+        if mode == "live":
+            self._recover()
         self.exchange = None
         self.last_exchange_check = self.last_snapshot = 0.0
         self.key_day = None  # 키 만료일도 바로 다시 확인
